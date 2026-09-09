@@ -1033,6 +1033,14 @@ class _Session:
     # turns. This preserves replay across empty streams, pre-output failures, and
     # soft Stops while surviving loss of the separate ``first_turn`` observation.
     provider_switch_replay: bool = False
+    # Set when allocation started this session FRESH because the key's mapped
+    # sid exists but was withheld for the open (adopted-transcript residue after
+    # a failed move -- ``session_map.ResumeLookup.withheld``). The mapping is the
+    # only way back to that conversation and the next open's recovery is what
+    # restores it, so no writer may promote this session's sid over it: not
+    # allocation, not ``close_all``'s persist, not a replay commit. Never a
+    # replay: nothing was loaded, so there is no history debt to settle.
+    resume_withheld: bool = False
     # Set of msg_ts values cancelled (message deleted while processing)
     cancelled: set[str] = field(default_factory=set)
     # Set after context compaction drops the session-start skill index.
@@ -2498,6 +2506,12 @@ class SessionManager:
         if session is None or not session.provider_switch_replay:
             return False
         if session.retire_on_identity_change:
+            session.provider_switch_replay = False
+            return True
+        if session.resume_withheld:
+            # A withheld mapping is the only route back to the conversation
+            # whose transcript still sits host-side: settle the replay, keep
+            # the mapping.
             session.provider_switch_replay = False
             return True
         if not _is_acp_provider(session.provider):

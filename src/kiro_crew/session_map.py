@@ -8,19 +8,30 @@ generic ChannelLink mirror map) for bidirectional sync.
 from __future__ import annotations
 
 import asyncio
+import enum
+import errno
 import functools
 import json
 import logging
 import os
+import stat
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import ParamSpec, TypeVar
+from typing import NamedTuple, ParamSpec, TypeVar
 
+from kiro_crew import pinned_fs
 from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
-from kiro_crew.config.paths import config_dir, kiro_sessions_dir
+from kiro_crew.atomic_write import fsync_dir
+from kiro_crew.config.paths import (
+    config_dir,
+    default_kiro_home,
+    foreign_data_home,
+    isolated_kiro_home,
+    kiro_sessions_dir,
+)
 from kiro_crew.messaging.link import (
     SLACK_NAMESPACE,
     UNBIND_REASON_ENTRY_DELETED,
@@ -51,11 +62,955 @@ SESSION_MAP_FILENAME = "session_map.json"
 # existing monkeypatch call sites keep working. See config.md "Data Home";
 # dashboard/handlers/usage.py is the reference implementation.
 _KIRO_SESSIONS_DIR: Path | None = None
+_ADOPTED_SOURCE_CACHE_LOCK = threading.Lock()
+_ADOPTED_SOURCE_CACHE: tuple[tuple[str | None, Path], Path | None] | None = None
+
+
+def _reset_adopted_source_cache() -> None:
+    """Clear the adopted transcript source memo after a test changes homes."""
+    global _ADOPTED_SOURCE_CACHE
+
+    with _ADOPTED_SOURCE_CACHE_LOCK:
+        _ADOPTED_SOURCE_CACHE = None
 
 
 def _kiro_sessions_dir() -> Path:
     """kiro-cli sessions directory, resolved against the live data home."""
     return _KIRO_SESSIONS_DIR if _KIRO_SESSIONS_DIR is not None else kiro_sessions_dir()
+
+
+def _adopted_transcript_source() -> Path | None:
+    """Return the host transcript dir while this process uses an adopted home."""
+    global _ADOPTED_SOURCE_CACHE
+
+    own_home = foreign_data_home()
+    if own_home is None:
+        return None
+    key = (os.environ.get("KIRO_HOME"), own_home)
+    with _ADOPTED_SOURCE_CACHE_LOCK:
+        cached = _ADOPTED_SOURCE_CACHE
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            # ``expanduser`` before ``resolve``: doctor's ``_explicit_kiro_home``
+            # canonicalizes the override the same way, so a literal-``~`` spelling
+            # it reports as isolated must not make this gate discard the mapping.
+            configured_kiro_home = Path(key[0] or "").expanduser().resolve()
+            adopted_kiro_home = isolated_kiro_home(own_home).resolve()
+        except (OSError, RuntimeError):
+            return None
+        source = (
+            default_kiro_home() / "sessions" / "cli"
+            if configured_kiro_home == adopted_kiro_home
+            else None
+        )
+        _ADOPTED_SOURCE_CACHE = (key, source)
+        return source
+
+
+def _source_may_hold_transcript(path: Path) -> bool:
+    """Fail closed when a source transcript exists or cannot be inspected."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except ValueError:
+        # An invalid pathname (embedded NUL from a corrupt map row) can hold no
+        # transcript; ``exists()`` reads it as absent, so this fence must too
+        # rather than aborting the caller's whole pass.
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _pending_in_host_dir(source: Path | None, sid: object) -> bool:
+    """True while an adopted-home sid's transcript still sits host-side.
+
+    The shared fence for every stale check (:meth:`SessionMap.get` and
+    :meth:`SessionMap.prune`): until that session is opened and its lazy move
+    succeeds, a host-side file is a live transcript, not stale state. Failed
+    moves leave that witness in place, so the mapping survives and the next
+    open retries. Fails closed when the source cannot be inspected; a sid that
+    is not a plain file name never matches (no traversal out of the host dir).
+    """
+    return (
+        source is not None
+        and isinstance(sid, str)
+        and bool(sid)
+        and Path(sid).name == sid
+        and _source_may_hold_transcript(source / f"{sid}.json")
+    )
+
+
+class _SourceRefused(OSError):
+    """The source of a transcript move is not a plain regular file (a symlink, a
+    FIFO, a directory) or changed identity between being looked at and being
+    opened; the file is left untouched and nothing is copied."""
+
+
+class _TranscriptDestination(NamedTuple):
+    """One destination name plus the directory descriptor that pins its parent.
+
+    ``dir_fd`` is absent only on platforms without descriptor-relative walks.
+    That branch retains the existing Windows look/open residual; POSIX publishes
+    and cleans up entirely relative to the descriptor opened once for ``path``'s
+    parent.
+    """
+
+    path: Path
+    dir_fd: int | None
+
+
+@contextmanager
+def _open_transcript_destination(root: Path, target: Path) -> Iterator[_TranscriptDestination]:
+    """Create and pin ``target``, refusing every linked lexical component.
+
+    Each missing directory is created as the final component of a
+    :func:`pinned_fs.create_and_open_dir_pinned` call. The final descriptor stays
+    open for both transcript publishes, so neither file re-resolves the parent by
+    name. Windows cannot express that walk and keeps the former by-name checks.
+    """
+    try:
+        relative = target.relative_to(root)
+    except ValueError as exc:
+        raise _SourceRefused(
+            errno.EINVAL,
+            f"adopted transcript directory {target} is outside isolated home {root}",
+        ) from exc
+
+    if not pinned_fs.supports_pinned_walk():
+
+        def _first_reparse_point() -> Path | None:
+            if pinned_fs.is_reparse_point(root):
+                return root
+            current = root
+            for part in relative.parts:
+                current = current / part
+                if pinned_fs.is_reparse_point(current):
+                    return current
+            return None
+
+        linked = _first_reparse_point()
+        if linked is not None:
+            raise _SourceRefused(
+                errno.ELOOP,
+                f"{linked} is a symbolic link or reparse point",
+            )
+        target.mkdir(parents=True, exist_ok=True)
+        linked = _first_reparse_point()
+        if linked is not None:
+            raise _SourceRefused(
+                errno.ELOOP,
+                f"{linked} became a symbolic link or reparse point",
+            )
+        yield _TranscriptDestination(target, None)
+        return
+
+    current = root
+    components = [root]
+    for part in relative.parts:
+        current = current / part
+        components.append(current)
+
+    target_fd: int | None = None
+    try:
+        for component in components:
+            opened = pinned_fs.create_and_open_dir_pinned(
+                component,
+                what="adopted transcript directory",
+                refusal=_SourceRefused,
+            )
+            if component == target:
+                target_fd = opened
+            else:
+                os.close(opened)
+        if target_fd is None:  # pragma: no cover - target is always in components
+            raise _SourceRefused(errno.EINVAL, "adopted transcript directory was not pinned")
+        yield _TranscriptDestination(target, target_fd)
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
+
+
+def _prepare_transcript_directory(root: Path, target: Path) -> Path | None:
+    """Create the recovery directory and report a linked lexical component.
+
+    A Windows-compatible screen for the recovery pass, not the publish
+    authority: the final writes use the descriptor returned by
+    :func:`_open_transcript_destination`.
+    """
+
+    def _first_link() -> Path | None:
+        if pinned_fs.is_reparse_point(root):
+            return root
+        try:
+            relative = target.relative_to(root)
+        except ValueError:
+            return target
+        current = root
+        for part in relative.parts:
+            current = current / part
+            if pinned_fs.is_reparse_point(current):
+                return current
+        return None
+
+    linked = _first_link()
+    if linked is not None:
+        return linked
+    target.mkdir(parents=True, exist_ok=True)
+    return _first_link()
+
+
+def _open_regular_file_no_follow(src: Path, *, dir_fd: int | None = None) -> int:
+    """Open ``src`` read-only without following a link and prove what was opened.
+
+    Returns a descriptor on a regular file, or raises :class:`_SourceRefused`.
+    ``lstat`` first refuses a symlink or special file by name; the open then
+    carries ``O_NOFOLLOW`` so a link swapped in after that look fails its own
+    open (``ELOOP``) instead of being read through; ``fstat`` on the descriptor
+    confirms a regular file with the same device and inode the ``lstat`` saw, so
+    the bytes copied are those of the file that was inspected. When ``dir_fd``
+    is supplied, both operations address ``src.name`` through that pinned parent.
+    Where ``O_NOFOLLOW`` does not exist (Windows) the open follows a link, and the
+    ``fstat``/``lstat`` identity check is what catches a swap -- a residual
+    look/open window on that platform, stated rather than closed.
+
+    A source with more than one hard link is NOT refused: the reader of this
+    directory is the same user who could read the linked file anyway, and
+    hard-link snapshot tools (``rsync --link-dest`` and kin) leave every file in a
+    home directory multiply linked -- refusing them would strand every transcript
+    of that install.
+    """
+    try:
+        if dir_fd is None:
+            before = os.lstat(src)
+        else:
+            before_at = pinned_fs.stat_at(dir_fd, src.name)
+            if before_at is None:
+                raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), src)
+            before = before_at
+    except OSError as exc:
+        raise _SourceRefused(exc.errno, f"cannot inspect {src.name}: {exc.strerror}") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise _SourceRefused(errno.EINVAL, f"{src.name} is not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        if dir_fd is None:
+            fd = os.open(src, flags)
+        else:
+            fd = os.open(src.name, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise _SourceRefused(exc.errno, f"cannot open {src.name}: {exc.strerror}") from exc
+    try:
+        after = os.fstat(fd)
+        if not stat.S_ISREG(after.st_mode):
+            raise _SourceRefused(errno.EINVAL, f"{src.name} is not a regular file")
+        if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+            raise _SourceRefused(errno.EINVAL, f"{src.name} changed while being opened")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _fsync_transcript_destination_dir(path: Path, dir_fd: int | None = None) -> None:
+    """Persist a published destination name before its source can be removed.
+
+    POSIX syncs the descriptor already pinning the destination. Windows retains
+    the repository's by-name compatibility helper because directory descriptors
+    are unavailable there. Unsupported directory-sync errors remain a quiet
+    degradation; real I/O errors still abort the move.
+    """
+    if dir_fd is None:
+        fsync_dir(path)
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        unsupported = {
+            value
+            for name in ("EINVAL", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EACCES", "EBADF", "ENOSYS")
+            if (value := getattr(errno, name, None)) is not None
+        }
+        if exc.errno not in unsupported:
+            raise
+
+
+def _unlink_transcript_destination(
+    destination: _TranscriptDestination, expected: tuple[int, int]
+) -> bool:
+    """Remove only the destination inode created by this migration attempt."""
+    if destination.dir_fd is not None:
+        return pinned_fs.unlink_verified(destination.dir_fd, destination.path.name, expected)
+    try:
+        current = os.lstat(destination.path)
+        if (current.st_dev, current.st_ino) != expected:
+            return False
+        os.unlink(destination.path)
+    except OSError:
+        return False
+    return True
+
+
+def _copy_transcript_no_follow(
+    src: Path, destination: Path | _TranscriptDestination
+) -> tuple[int, int]:
+    """Copy ``src`` to an exclusive destination through verified descriptors.
+
+    On POSIX both source and destination are descriptor-pinned. The source
+    descriptor is handed directly to :func:`pinned_fs.copy_file_pinned`; the
+    destination name is created relative to the directory descriptor held for
+    the whole pair. The returned identity lets rollback remove only this
+    attempt's inode. A failure also cleans up only that witnessed inode.
+
+    The source is the user's own host transcript, already judged a regular file
+    by :func:`_open_regular_file_no_follow`, so the copier is told to accept a
+    source with more than one hard link (the ``allow_multilink_source`` opt-in,
+    for the snapshot-tool homes that opener's docstring names). Every
+    destination-side guarantee of the copier is unchanged.
+    """
+    if isinstance(destination, Path):
+        destination = _TranscriptDestination(destination, None)
+    source_fd = _open_regular_file_no_follow(src)
+    source_stat = os.fstat(source_fd)
+    expected_source = (source_stat.st_dev, source_stat.st_ino)
+    opened: list[os.stat_result] = []
+    refused: list[str] = []
+    try:
+        copy_source_fd = source_fd
+        source_fd = -1  # ownership transfers to ``copy_file_pinned``
+        copied = pinned_fs.copy_file_pinned(
+            os.fspath(src),
+            os.fspath(destination.path) if destination.dir_fd is None else None,
+            src_fd=copy_source_fd,
+            dst_dir_fd=destination.dir_fd,
+            dst_name=destination.path.name if destination.dir_fd is not None else None,
+            force_mode=0o600,
+            expected_src_ident=expected_source,
+            allow_multilink_source=True,
+            on_skip=lambda reason, _path: refused.append(reason),
+            on_opened=opened.append,
+            fsync=True,
+        )
+        if not copied:
+            reason = refused[-1] if refused else "copy refused"
+            raise _SourceRefused(errno.EINVAL, f"{src.name} was not copied ({reason})")
+        if len(opened) != 1:  # pragma: no cover - central copier contract
+            raise OSError(errno.EIO, f"no destination identity recorded for {src.name}")
+        identity = (opened[0].st_dev, opened[0].st_ino)
+        _fsync_transcript_destination_dir(destination.path.parent, destination.dir_fd)
+        return identity
+    except BaseException:
+        if opened:
+            identity = (opened[0].st_dev, opened[0].st_ino)
+            _unlink_transcript_destination(destination, identity)
+        raise
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+
+
+# Per-sid serialization for the lazy transcript move. Two concurrent opens of
+# one session (a dashboard resume racing an inbound channel reply) must not both
+# publish the pair: the second waits, then finds nothing left pending. Kept apart
+# from :data:`_MAP_LOCK` on purpose -- the move is unbounded file I/O and must
+# never run under the map lock (see the class threading contract). Entries with
+# a pending host transcript remain reusable; terminal entries leave when their
+# final resolver releases its reference.
+_MIGRATION_LOCKS_GUARD = threading.Lock()
+_MIGRATION_LOCKS: dict[str, threading.Lock] = {}
+_MIGRATION_LOCK_REFS: dict[str, int] = {}
+
+
+def _migration_lock(sid: str) -> threading.Lock:
+    with _MIGRATION_LOCKS_GUARD:
+        lock = _MIGRATION_LOCKS.get(sid)
+        if lock is None:
+            lock = _MIGRATION_LOCKS[sid] = threading.Lock()
+        _MIGRATION_LOCK_REFS[sid] = _MIGRATION_LOCK_REFS.get(sid, 0) + 1
+        return lock
+
+
+def _release_migration_lock(sid: str, lock: threading.Lock, *, terminal: bool) -> None:
+    """Release one resolver reference and evict an idle terminal lock."""
+    with _MIGRATION_LOCKS_GUARD:
+        if _MIGRATION_LOCKS.get(sid) is not lock:
+            return
+        remaining = _MIGRATION_LOCK_REFS[sid] - 1
+        if remaining:
+            _MIGRATION_LOCK_REFS[sid] = remaining
+        elif terminal:
+            _MIGRATION_LOCK_REFS.pop(sid, None)
+            _MIGRATION_LOCKS.pop(sid, None)
+        else:
+            _MIGRATION_LOCK_REFS[sid] = 0
+
+
+def host_transcript_pending(sid: object) -> bool:
+    """Cheap detection: does *sid*'s transcript still sit in the host ``~/.kiro``?
+
+    One ``lstat`` at most (none on the default home), so it is safe on the event
+    loop and inside guarded :meth:`SessionMap.get`. The MOVE it detects the need
+    for is :func:`resolve_host_transcript`, which is neither.
+    """
+    return _pending_in_host_dir(_adopted_transcript_source(), sid)
+
+
+class MigrationOutcome(enum.Enum):
+    """How one lazy transcript move attempt ended.
+
+    A diagnostic label for the attempt, carried to the log line beside the
+    serve/withhold verdict. It is NOT the verdict's input: that decision is
+    :func:`_serve_verdict`'s single predicate on the disk the attempt left,
+    :func:`_host_pair_complete`.
+    """
+
+    MIGRATED = "migrated"
+    """The adopted pair is complete and durable; the host witness is gone."""
+
+    NOT_PENDING = "not-pending"
+    """Nothing host-side to move (default home, opt-out, or already moved)."""
+
+    FAILED = "failed"
+    """The move did not complete. What that means for the open is decided
+    from the disk, not from this label."""
+
+
+def _host_pair_complete(source: Path, sid: str) -> bool:
+    """Is a complete, resumable host pair for *sid* sitting in *source*?
+
+    The ONE predicate behind both the serve/withhold verdict and the recovery
+    rule: a plain regular ``<sid>.json`` beside a plain regular ``<sid>.jsonl``
+    of at least 10 bytes. A pair that is provably absent or incomplete -- a
+    missing file, a pathname that can hold no file, a link or special file at
+    either name, an empty journal -- answers ``False``: there is nothing
+    resumable to lose. A pair that CANNOT be inspected answers ``True``: it is
+    not proven safe to hand out a sid over.
+    """
+    try:
+        stats = [(source / f"{sid}{suffix}").lstat() for suffix in (".json", ".jsonl")]
+    except (FileNotFoundError, ValueError):
+        return False
+    except OSError:
+        return True
+    return all(stat.S_ISREG(item.st_mode) for item in stats) and stats[1].st_size >= 10
+
+
+def _attempt_host_transcript_move(sid: str) -> MigrationOutcome:
+    """One move attempt for *sid*. The caller holds ``_migration_lock(sid)``.
+
+    Re-reads the pending state first: a concurrent open of this sid may have
+    completed the move while the caller waited for the lock. Never raises: an
+    unexpected failure is logged and reported as ``FAILED``; the verdict is
+    then read from the disk, never from the exception.
+    """
+    if not host_transcript_pending(sid):
+        return MigrationOutcome.NOT_PENDING
+    try:
+        return _migrate_adopted_transcript(sid)
+    except Exception:
+        logger.warning("Lazy transcript migration failed for %s", sid, exc_info=True)
+        return MigrationOutcome.FAILED
+
+
+def _serve_verdict(sid: str, outcome: MigrationOutcome) -> str | None:
+    """The serve/withhold decision for one attempt, read from the disk it left.
+
+    INVARIANT: a sid is served only when its transcript is provably at the
+    adopted location kiro-cli reads, or there is provably nothing to lose;
+    while a complete host pair sits unmoved, the mapping is never overwritten.
+
+    ``NOT_PENDING`` means there was nothing to move -- no host-side witness, or
+    the host directory IS the directory kiro-cli reads -- so the sid is served
+    as it stands. Every other attempt is judged by one predicate on the disk it
+    left, :func:`_host_pair_complete` on the host directory. A complete host
+    pair still present means the move did not happen (a copy failure, a
+    refused destination, a residue left in place): kiro-cli, reading the
+    adopted directory, would find nothing, start fresh, and the fresh sid would
+    replace this mapping -- the only route back to that conversation. So the
+    sid is withheld (``None``) and the next open retries. A host pair that is
+    gone (migrated) or incomplete (no resumable journal) has nothing left to
+    lose: the sid is served. Whether the attempt reported ``MIGRATED`` or
+    ``FAILED`` is never consulted; the label only names the attempt in the log
+    line.
+
+    The ONE place the verdict is spelled, and it is evaluated under the per-sid
+    lock by :func:`resolve_host_transcript`: the disk is judged at the moment
+    the attempt ended, while no later attempt on the same sid can have changed
+    it.
+    """
+    if outcome is MigrationOutcome.NOT_PENDING:
+        return sid
+    source = _adopted_transcript_source()
+    if source is not None and _host_pair_complete(source, sid):
+        logger.warning(
+            "Not serving session %s after a %s transcript move: its complete host "
+            "transcript pair is still in place, so the mapping is kept for the next open",
+            sid,
+            outcome.value,
+        )
+        return None
+    return sid
+
+
+def resolve_host_transcript(sid: str) -> str | None:
+    """Attempt the move and decide serve/withhold ATOMICALLY for one sid.
+
+    The off-loop half of a session open, and the only production caller of the
+    move: the decision is made under ``_migration_lock(sid)`` against the state
+    the attempt itself just left, so no caller can consume a verdict older than
+    the last attempt on that sid: a second resolver for the same sid blocks until
+    this decision is made, then attempts and decides against what THIS attempt
+    left. (Two attempts for one sid can still interleave with the sid's
+    lifetime -- a verdict is a point-in-time answer while a session lives on --
+    which is why the recovery pre-pass never removes bytes the host pair does
+    not also hold, rather than relying on this ordering alone.) Never takes
+    :data:`_MAP_LOCK` and never touches the map: the copy and its durability
+    barriers are unbounded, and holding either lock across them stalls the
+    gateway. Off-loop, never raises.
+    """
+    if not host_transcript_pending(sid):
+        return sid
+    lock = _migration_lock(sid)
+    terminal = False
+    try:
+        with lock:
+            verdict = _serve_verdict(sid, _attempt_host_transcript_move(sid))
+            terminal = not host_transcript_pending(sid)
+            return verdict
+    finally:
+        _release_migration_lock(sid, lock, terminal=terminal)
+
+
+class ResumeLookup(NamedTuple):
+    """What the allocation path may do with a key's mapping, in two facts.
+
+    ``sid`` is what may be handed to kiro-cli: ``None`` when nothing is
+    resumable. ``withheld`` separates the two reasons for that ``None``: the key
+    has no live mapping at all (a fresh sid may be promoted over it), or it HAS
+    one that this open must not serve (its complete host transcript pair is
+    still unmoved after a failed move -- see :func:`_serve_verdict`). A withheld
+    mapping is the only path back to that conversation, so a caller that starts
+    a fresh session in its place must never promote the fresh sid over it.
+    """
+
+    sid: str | None
+    withheld: bool
+
+
+async def resolve_resume_sid(session_map: "SessionMap", key: str) -> ResumeLookup:
+    """The resumable sid for *key*, migrating a host-side transcript first.
+
+    ``session_map.get`` is the cheap, guarded liveness read; when it answers a
+    sid whose transcript is still host-side, the move AND the serve decision run
+    together on a worker thread under the sid's own lock
+    (:func:`resolve_host_transcript`), and liveness is re-read afterwards.
+
+    A failed move -- whatever it left at the adopted names -- leaves the
+    complete host pair unmoved, and that withholds the sid for this open
+    (``ResumeLookup(None, withheld=True)``, nothing served): kiro-cli would
+    otherwise find nothing at the adopted names, start fresh, and the fresh
+    sid would replace the mapping. Nothing is lost by withholding: the mapping
+    and the complete host pair are untouched, and the next open retries the
+    move (clearing any stale partial first) -- PROVIDED the mapping survives
+    that open, which is what ``withheld`` tells the caller
+    (:mod:`session_allocation` serves a fresh session but does not promote its
+    sid). A persistently failing filesystem makes resume unavailable until it
+    recovers, never silently lossy. Callers that only READ a sid keep using
+    ``get``; this is for the path that is about to hand the sid to kiro-cli.
+    """
+    sid = session_map.get(key)
+    if sid and host_transcript_pending(sid):
+        served = await asyncio.to_thread(resolve_host_transcript, sid)
+        if served is None:
+            logger.warning(
+                "Not resuming %s: the transcript of session %s is still host-side after "
+                "a failed move; nothing is served over it, and the next open retries",
+                key,
+                sid,
+            )
+            return ResumeLookup(None, withheld=True)
+        sid = session_map.get(key)
+    return ResumeLookup(sid, withheld=False)
+
+
+_COMPARE_CHUNK = 1 << 20
+
+
+def _is_prefix_copy(host: Path, residue: Path, *, residue_dir_fd: int | None = None) -> bool:
+    """Does *residue* hold a prefix of -- or exactly -- the bytes of *host*?
+
+    ``True`` for a byte-equal copy and for a strict prefix: the copier streams
+    the source, so an interrupted copy is always a prefix, and a completed copy
+    whose host pair was never retired is equal. Every byte such a file holds is
+    also in the host file, so removing it loses nothing. ``False`` for anything
+    else -- a longer file, or one that differs anywhere -- because those hold
+    bytes the host file does not, and nothing here may remove them. Both files
+    are opened through the no-follow opener and compared in chunks; a supplied
+    ``residue_dir_fd`` keeps the destination parent pinned across inspection,
+    comparison and removal. Raises the opener's ``OSError`` when either cannot
+    be read as a plain file.
+    """
+    host_fd = _open_regular_file_no_follow(host)
+    try:
+        residue_fd = _open_regular_file_no_follow(residue, dir_fd=residue_dir_fd)
+    except BaseException:
+        os.close(host_fd)
+        raise
+    with os.fdopen(host_fd, "rb") as host_file, os.fdopen(residue_fd, "rb") as residue_file:
+        host_len = os.fstat(host_file.fileno()).st_size
+        residue_len = os.fstat(residue_file.fileno()).st_size
+        if residue_len > host_len:
+            return False
+        remaining = residue_len
+        while remaining:
+            want = min(remaining, _COMPARE_CHUNK)
+            host_chunk = host_file.read(want)
+            residue_chunk = residue_file.read(want)
+            if not host_chunk or not residue_chunk:
+                return False  # shrank under us: not comparable
+            if host_chunk[: len(residue_chunk)] != residue_chunk[: len(host_chunk)]:
+                return False
+            remaining -= min(len(host_chunk), len(residue_chunk))
+    return True
+
+
+def _retire_host_pair(
+    sid: str,
+    source: Path,
+    host_json: Path,
+    host_jsonl: Path,
+    host_json_stat: os.stat_result,
+    host_jsonl_stat: os.stat_result,
+) -> bool:
+    """Remove the unchanged host pair once the adopted pair is authoritative.
+
+    The host ``.json`` is the liveness witness every stale check keys on: once it
+    is gone the pair counts as migrated, and a leftover host ``.jsonl`` is an
+    inert orphan nothing keys on. Both names are revalidated before either is
+    removed so a foreign append or replacement during the copy window leaves the
+    authoritative host pair intact. Answers ``False`` when the pair changed or
+    the witness could not be removed; the caller decides what that means for the
+    adopted files.
+    """
+    expected = ((host_json, host_json_stat), (host_jsonl, host_jsonl_stat))
+    for path, recorded in expected:
+        try:
+            current = path.lstat()
+        except OSError as exc:
+            logger.warning(
+                "Could not revalidate host transcript %s for session %s: %s", path, sid, exc
+            )
+            return False
+        if (current.st_ino, current.st_size, current.st_mtime_ns) != (
+            recorded.st_ino,
+            recorded.st_size,
+            recorded.st_mtime_ns,
+        ):
+            logger.warning(
+                "Not retiring host transcript for session %s: %s changed during its copy",
+                sid,
+                path,
+            )
+            return False
+    try:
+        os.unlink(host_json)
+    except OSError as exc:
+        logger.warning(
+            "Could not remove host transcript %s for session %s: %s", host_json, sid, exc
+        )
+        return False
+    try:
+        os.unlink(host_jsonl)
+    except OSError as exc:
+        logger.warning("Could not remove migrated journal %s: %s", host_jsonl, exc)
+    try:
+        fsync_dir(source)
+    except OSError as exc:
+        logger.warning("Could not sync migrated transcript source %s: %s", source, exc)
+    return True
+
+
+def _publish_adopted_transcript_pair(
+    *,
+    sid: str,
+    source: Path,
+    host_json: Path,
+    host_jsonl: Path,
+    host_json_stat: os.stat_result,
+    host_jsonl_stat: os.stat_result,
+    adopted_json: Path,
+    adopted_jsonl: Path,
+    destination_dir: _TranscriptDestination,
+) -> MigrationOutcome:
+    """Publish journal then state relative to one pinned destination directory."""
+    destinations = {
+        adopted_jsonl: _TranscriptDestination(adopted_jsonl, destination_dir.dir_fd),
+        adopted_json: _TranscriptDestination(adopted_json, destination_dir.dir_fd),
+    }
+    created: list[tuple[_TranscriptDestination, tuple[int, int]]] = []
+    try:
+        journal_destination = destinations[adopted_jsonl]
+        journal_identity = _copy_transcript_no_follow(host_jsonl, journal_destination)
+        created.append((journal_destination, journal_identity))
+        state_destination = destinations[adopted_json]
+        state_identity = _copy_transcript_no_follow(host_json, state_destination)
+        created.append((state_destination, state_identity))
+    except FileExistsError:
+        logger.warning("Not moving session %s: its adopted transcript name is occupied", sid)
+    except _SourceRefused as exc:
+        logger.warning("Not moving session %s: %s", sid, exc.strerror)
+    except OSError as exc:
+        logger.warning("Could not move session %s into %s: %s", sid, destination_dir.path, exc)
+    else:
+        if _retire_host_pair(
+            sid,
+            source,
+            host_json,
+            host_jsonl,
+            host_json_stat,
+            host_jsonl_stat,
+        ):
+            logger.info(
+                "Moved session transcript %s into this instance's kiro home %s",
+                sid,
+                destination_dir.path,
+            )
+            return MigrationOutcome.MIGRATED
+        # The adopted pair must not stay beside a complete host pair as a
+        # duplicate that a later open would have to reconcile: roll it back,
+        # unless something has already written into it (below).
+
+    # Rollback. Its completion is EXPLICIT, and it never removes bytes this
+    # attempt did not write: a journal that grew since this attempt wrote it
+    # holds appends this code cannot account for, so the whole adopted pair is
+    # left in place, untouched -- the next open's recovery finds a journal
+    # that is not a prefix copy and withholds, never removes.
+    grew = False
+    journal_created = next((item for item in created if item[0].path == adopted_jsonl), None)
+    if journal_created is not None:
+        journal_destination, journal_identity = journal_created
+        try:
+            current: os.stat_result | None
+            if journal_destination.dir_fd is None:
+                current = os.lstat(journal_destination.path)
+            else:
+                current = pinned_fs.stat_at(
+                    journal_destination.dir_fd, journal_destination.path.name
+                )
+            if current is None:
+                raise FileNotFoundError(journal_destination.path)
+            grew = (
+                current.st_dev,
+                current.st_ino,
+            ) != journal_identity or current.st_size != host_jsonl_stat.st_size
+        except OSError:
+            grew = True  # cannot prove it unchanged: do not remove it
+    if grew:
+        logger.warning(
+            "Journal %s changed under a failed move of session %s; the adopted pair is "
+            "left in place, and resume is withheld until someone reconciles it by hand",
+            adopted_jsonl,
+            sid,
+        )
+    else:
+        for destination, identity in reversed(created):
+            if not _unlink_transcript_destination(destination, identity):
+                logger.warning(
+                    "Rollback could not remove %s for session %s; resume is withheld until "
+                    "the next open clears it",
+                    destination.path.name,
+                    sid,
+                )
+        if created:
+            try:
+                _fsync_transcript_destination_dir(destination_dir.path, destination_dir.dir_fd)
+            except OSError as exc:
+                logger.warning(
+                    "Could not sync lazy-migration rollback in %s: %s",
+                    destination_dir.path,
+                    exc,
+                )
+    return MigrationOutcome.FAILED
+
+
+def _migrate_adopted_transcript(sid: str) -> MigrationOutcome:
+    """Move one adopted-home transcript pair; restart-safe and lossless.
+
+    The journal is published first and the state file last, both through the
+    hardened exclusive copier, so kiro-cli -- which loads a session only once
+    its state file exists -- can never load a journal that is still being
+    written. The host ``.json`` (the liveness witness every stale check keys on)
+    is removed only after both adopted files are durable.
+
+    RECOVERY runs before every publish, while the COMPLETE host pair still
+    exists. Whatever holds an adopted name then is judged against the host file
+    of the same name (:func:`_is_prefix_copy`): a plain regular file whose bytes
+    are a prefix of, or equal to, the host file is a stale partial -- an
+    interrupted copy, or a completed copy whose host pair was never retired --
+    and is cleared so the pair can be republished from the immutable host pair,
+    so a crash can never strand a resume behind an ``O_EXCL`` collision. No
+    session is ever served a sid while its complete host pair sits unmoved
+    (:func:`_serve_verdict`), so nothing appends to an adopted name in that
+    state and a stale partial is the only residue this code produces. A file
+    that is NOT a prefix copy holds bytes the host pair does not: it is not this
+    code's to remove, so nothing is touched and the open is withheld until
+    someone reconciles the two by hand.
+
+    Only plain regular files are ever removed: a symlink or special file at an
+    adopted name refuses the whole move, never followed, never replaced. If the
+    host witness cannot be removed after a complete publish, the freshly
+    published pair is rolled back -- unless the journal has grown since it was
+    written, which this code cannot account for; then it is left in place,
+    untouched, for a hand reconciliation. Every failure exit answers ``FAILED``
+    and the verdict is read from the host pair that remains.
+    """
+    source = _adopted_transcript_source()
+    if source is None or not sid or Path(sid).name != sid:
+        return MigrationOutcome.NOT_PENDING
+    target = _kiro_sessions_dir()
+    own_home = foreign_data_home()
+    if own_home is None:
+        return MigrationOutcome.FAILED
+    own_root = isolated_kiro_home(own_home)
+    try:
+        if not source.is_dir() or source.resolve() == target.resolve():
+            return MigrationOutcome.NOT_PENDING
+    except (OSError, RuntimeError):
+        return MigrationOutcome.FAILED
+
+    host_json, host_jsonl = source / f"{sid}.json", source / f"{sid}.jsonl"
+    adopted_json, adopted_jsonl = target / f"{sid}.json", target / f"{sid}.jsonl"
+    try:
+        host_json_stat, host_jsonl_stat = host_json.lstat(), host_jsonl.lstat()
+    except (OSError, ValueError):
+        return MigrationOutcome.FAILED
+    if not (stat.S_ISREG(host_json_stat.st_mode) and stat.S_ISREG(host_jsonl_stat.st_mode)):
+        logger.warning("Not moving session %s: its host transcript is not a plain file pair", sid)
+        return MigrationOutcome.FAILED
+    if host_jsonl_stat.st_size < 10:
+        return MigrationOutcome.FAILED
+
+    try:
+        linked = _prepare_transcript_directory(own_root, target)
+    except OSError as exc:
+        logger.warning("Could not prepare adopted transcript directory %s: %s", target, exc)
+        return MigrationOutcome.FAILED
+    if linked is not None:
+        logger.warning(
+            "Not moving session transcripts into %s: %s is a symlink, "
+            "so the files would leave this instance's kiro home %s",
+            target,
+            linked,
+            own_root,
+        )
+        return MigrationOutcome.FAILED
+
+    # Recovery and publish share one pinned destination descriptor so every
+    # adopted-name operation addresses the same parent directory.
+    try:
+        with _open_transcript_destination(own_root, target) as destination_dir:
+            residue: list[tuple[Path, _TranscriptDestination, tuple[int, int]]] = []
+            for host_file, dst in (
+                (host_json, adopted_json),
+                (host_jsonl, adopted_jsonl),
+            ):
+                destination = _TranscriptDestination(dst, destination_dir.dir_fd)
+                try:
+                    if destination.dir_fd is None:
+                        dst_stat = dst.lstat()
+                    else:
+                        dst_stat_at = pinned_fs.stat_at(destination.dir_fd, dst.name)
+                        if dst_stat_at is None:
+                            continue
+                        dst_stat = dst_stat_at
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    logger.warning(
+                        "Not moving session %s: cannot inspect %s: %s",
+                        sid,
+                        dst.name,
+                        exc,
+                    )
+                    return MigrationOutcome.FAILED
+                if not stat.S_ISREG(dst_stat.st_mode):
+                    # A link (dangling or not) or a special file is never ours to
+                    # remove and never followed; the source stays where it is.
+                    logger.warning(
+                        "Not moving session %s: %s is held by a non-regular file",
+                        sid,
+                        dst.name,
+                    )
+                    return MigrationOutcome.FAILED
+                residue.append(
+                    (
+                        host_file,
+                        destination,
+                        (dst_stat.st_dev, dst_stat.st_ino),
+                    )
+                )
+            for host_file, destination, _identity in residue:
+                try:
+                    stale = _is_prefix_copy(
+                        host_file,
+                        destination.path,
+                        residue_dir_fd=destination.dir_fd,
+                    )
+                except OSError as exc:
+                    logger.warning(
+                        "Not moving session %s: cannot compare %s: %s",
+                        sid,
+                        destination.path.name,
+                        exc,
+                    )
+                    return MigrationOutcome.FAILED
+                if not stale:
+                    logger.warning(
+                        "Not moving session %s: %s holds bytes that %s does not; it is "
+                        "not removed, and resume is withheld until someone reconciles "
+                        "the two by hand",
+                        sid,
+                        destination.path,
+                        host_file,
+                    )
+                    return MigrationOutcome.FAILED
+            for _host_file, destination, identity in residue:
+                if not _unlink_transcript_destination(destination, identity):
+                    logger.warning(
+                        "Could not clear stale partial %s for session %s",
+                        destination.path.name,
+                        sid,
+                    )
+                    return MigrationOutcome.FAILED
+            if residue:
+                _fsync_transcript_destination_dir(destination_dir.path, destination_dir.dir_fd)
+                logger.info(
+                    "Recovered %d stale partial transcript file(s) for session %s",
+                    len(residue),
+                    sid,
+                )
+
+            # Publish journal first and state file last. The state name makes the
+            # pair loadable, and the descriptor stays open across both creates.
+            return _publish_adopted_transcript_pair(
+                sid=sid,
+                source=source,
+                host_json=host_json,
+                host_jsonl=host_jsonl,
+                host_json_stat=host_json_stat,
+                host_jsonl_stat=host_jsonl_stat,
+                adopted_json=adopted_json,
+                adopted_jsonl=adopted_jsonl,
+                destination_dir=destination_dir,
+            )
+    except _SourceRefused as exc:
+        logger.warning("Not moving session transcripts into %s: %s", target, exc.strerror)
+    except OSError as exc:
+        logger.warning("Could not pin adopted transcript directory %s: %s", target, exc)
+    return MigrationOutcome.FAILED
 
 
 # Per-conversation flag recording a refusal of automatic origin mirroring. Named
@@ -848,6 +1803,12 @@ class SessionMap:
         if (entry.get("provider") or PROVIDER_LABEL_DEFAULT) != PROVIDER_LABEL_DEFAULT:
             return sid
         sessions_dir = _kiro_sessions_dir()
+        # DETECT only. The move itself is unbounded file I/O and runs off this
+        # lock and off the loop in :func:`resolve_host_transcript`, reached
+        # through :func:`resolve_resume_sid` on the path that hands the sid to
+        # kiro-cli. Here the host-side file is simply a live transcript.
+        host_pending = host_transcript_pending(sid)
+
         if sid and (sessions_dir / f"{sid}.json").exists():
             jsonl = sessions_dir / f"{sid}.jsonl"
             try:
@@ -855,9 +1816,16 @@ class SessionMap:
             except FileNotFoundError:
                 jsonl_size = 0
             if jsonl_size < 10:
+                if host_pending:
+                    # A stale partial from an interrupted move, not an empty
+                    # session: the host pair is the transcript and the next
+                    # move recovers the partial.
+                    return sid
                 logger.info("Session %s has empty JSONL — pruning stale entry for %s", sid, key)
                 self._repair_or_remove_stale(matched_key)
                 return None
+            return sid
+        if host_pending:
             return sid
         if sid:
             self._repair_or_remove_stale(matched_key)
@@ -1177,6 +2145,7 @@ class SessionMap:
         does.
         """
         sessions_dir = _kiro_sessions_dir()
+        adopted_source = _adopted_transcript_source()
         stale: list[str] = []
         repaired = False
         for key, entry in self._data.items():
@@ -1186,7 +2155,12 @@ class SessionMap:
                 continue
             sid = entry.get("sid")
             survives = _survives_prune(entry)
-            if sid and not (sessions_dir / f"{sid}.json").exists():
+            target_missing = bool(sid) and not (sessions_dir / f"{sid}.json").exists()
+            if target_missing and _pending_in_host_dir(adopted_source, sid):
+                # See _pending_in_host_dir: the host-side file is a live
+                # transcript awaiting its request-driven move, never stale state.
+                continue
+            if target_missing:
                 if survives:
                     _stash_and_clear_sid(entry)
                     repaired = True

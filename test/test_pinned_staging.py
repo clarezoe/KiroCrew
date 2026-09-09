@@ -224,6 +224,80 @@ def test_a_single_link_regular_file_still_copies_with_mode_and_mtime(tmp_path: P
     assert dst.stat().st_mtime_ns == src.stat().st_mtime_ns
 
 
+def test_a_caller_validated_descriptor_may_read_a_multiply_linked_source(tmp_path: Path) -> None:
+    """``allow_multilink_source`` lifts the alias screen for a READ the caller vetted.
+
+    A home kept by ``rsnapshot`` / ``rsync --link-dest`` / ``cp -al`` has every file
+    with a second name in the snapshot tree, so ``st_nlink`` is 2 on files nobody
+    planted. A caller that opened and judged its own descriptor may say so; the
+    bytes land, the destination is still created exclusively, and the second name
+    keeps its bytes.
+    """
+    src = tmp_path / "transcript.jsonl"
+    src.write_text("line\n", encoding="utf-8")
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    try:
+        os.link(src, snapshot / "transcript.jsonl")
+    except (OSError, NotImplementedError):  # pragma: no cover - platform dependent
+        pytest.skip("hard links are unavailable on this host")
+    assert src.stat().st_nlink == 2
+    dst = tmp_path / "copied.jsonl"
+    fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+
+    copied = pinned_fs.copy_file_pinned(str(src), str(dst), src_fd=fd, allow_multilink_source=True)
+
+    assert copied is True
+    assert dst.read_text(encoding="utf-8") == "line\n"
+    assert dst.stat().st_nlink == 1
+    assert (snapshot / "transcript.jsonl").read_text(encoding="utf-8") == "line\n"
+    with pytest.raises(FileExistsError):
+        pinned_fs.copy_file_pinned(
+            str(src),
+            str(dst),
+            src_fd=os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)),
+            allow_multilink_source=True,
+        )
+
+
+def test_the_multilink_opt_in_is_refused_without_a_caller_descriptor(tmp_path: Path) -> None:
+    """A by-name open is this call's own first look, so the flag has no standing there."""
+    src = tmp_path / "plain.txt"
+    src.write_text("content\n", encoding="utf-8")
+    dst = tmp_path / "copied.txt"
+
+    with pytest.raises(ValueError, match="src_fd"):
+        pinned_fs.copy_file_pinned(str(src), str(dst), allow_multilink_source=True)
+
+    assert not dst.exists()
+
+
+def test_the_multilink_opt_in_does_not_lift_the_regular_file_screen(tmp_path: Path) -> None:
+    """Only the link-count half is relaxed; a non-regular source is still refused."""
+    if not hasattr(os, "mkfifo"):  # pragma: no cover - platform dependent
+        pytest.skip("mkfifo is unavailable on this host")
+    fifo = tmp_path / "pipe"
+    try:
+        os.mkfifo(fifo)
+    except (OSError, NotImplementedError):  # pragma: no cover - platform dependent
+        pytest.skip("mkfifo is unavailable on this host")
+    dst = tmp_path / "copied"
+    fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+
+    seen: list[tuple[str, str]] = []
+    copied = pinned_fs.copy_file_pinned(
+        str(fifo),
+        str(dst),
+        src_fd=fd,
+        allow_multilink_source=True,
+        on_skip=lambda r, p: seen.append((r, p)),
+    )
+
+    assert copied is False
+    assert seen and seen[0][0] == pinned_fs.SKIP_NOT_REGULAR
+    assert not dst.exists()
+
+
 def test_an_oversize_source_is_refused_before_the_destination_exists(tmp_path: Path) -> None:
     """GPT review r12: a ceiling checked only AFTER a copy lets the copy itself
     exhaust the destination volume. The fstat pre-check refuses first -- and

@@ -198,6 +198,49 @@ class TestDataHome:
         assert "rm -rf" not in out
 
 
+class TestSharedSpecProbeForeignShape:
+    """The isolated-home doctor line's advisory probe of the host ``~/.kiro/agents/
+    kirocrew.json`` promises that a foreign-shaped file is silence, not a finding
+    -- and never an abort of the whole doctor run."""
+
+    def test_a_deeply_nested_shared_spec_is_silence_not_a_crash(
+        self, monkeypatch, tmp_path: Path, capsys
+    ) -> None:
+        # ``json.loads`` answers pathological nesting with ``RecursionError``,
+        # a RuntimeError -- not the ValueError a syntax error raises -- so a
+        # handler tuned to malformed JSON alone lets it escape through
+        # ``_doctor_kiro_home`` and abort ``_doctor_data_home``. The bytes are
+        # built by repetition, not ``json.dumps``: 100_000 levels sits far past
+        # every CPython C-recursion limit (8000 on 3.12) at 200 KB, well under
+        # ``hooks.MAX_FILE_BYTES``, so the probe reaches the parse.
+        from kiro_crew.config import paths
+        from kiro_crew.config.paths import isolated_kiro_home
+
+        if not cli_doctor.pinned_fs.supports_pinned_walk():
+            pytest.skip("the shared-spec probe requires a descriptor-pinned walk")
+
+        user = tmp_path / "user"
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: user))
+        monkeypatch.setattr(paths, "_default_home", lambda: user / ".kiro" / "crew")
+        monkeypatch.setattr(paths, "_legacy_home", lambda: user / ".kirocrew")
+        scratch = tmp_path / "relocated-home"
+        scratch.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(scratch))
+        monkeypatch.setenv("KIRO_HOME", str(isolated_kiro_home(scratch)))
+        agents = user / ".kiro" / "agents"
+        agents.mkdir(parents=True)
+        depth = 100_000
+        (agents / cli_doctor.AGENT_FILENAME).write_bytes(b"[" * depth + b"]" * depth)
+
+        # Completing without raising IS the assertion; the unparseable spec
+        # must also not be reported as a pin.
+        cli_doctor._doctor_kiro_home(scratch.resolve())
+
+        out = capsys.readouterr().out
+        assert "kiro home:" in out and "isolated" in out
+        assert "shared spec" not in out
+
+
 class TestPodSessionBus:
     """`kirocrew doctor` Pods section — the systemd --user session bus.
 

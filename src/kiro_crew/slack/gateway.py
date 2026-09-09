@@ -13853,6 +13853,9 @@ class GatewayOrchestrator:
         async def _start_bg_session() -> None:
             try:
                 assert self.sessions is not None
+                # ``start_pool`` performs the initial prune. Host-side adopted
+                # transcripts stay live through the shared two-location fence
+                # until their individual session is opened and migrated.
                 await self.sessions.start_pool(blocking=False)
                 logger.info("Background session starting")
             except Exception:

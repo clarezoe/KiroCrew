@@ -30,9 +30,12 @@ def _make_kiro_session(kiro_dir, sid: str) -> None:
 
 @pytest.fixture()
 def patched(tmp_path, monkeypatch):
+    from kiro_crew import session_map as sm_mod
+
     kiro = tmp_path / "kiro"
     monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
     monkeypatch.setattr("kiro_crew.session_map._KIRO_SESSIONS_DIR", kiro)
+    sm_mod._reset_adopted_source_cache()
     return tmp_path, kiro
 
 

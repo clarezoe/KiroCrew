@@ -87,6 +87,7 @@ class _SessionEntry(Protocol):
     semaphore: asyncio.BoundedSemaphore
     first_turn: object
     provider_switch_replay: bool
+    resume_withheld: bool
     retire_on_identity_change: bool
     prev_turn_cancelled: bool
 
@@ -1843,6 +1844,11 @@ class SessionLifecycleService:
                 # The identity sweep already moved this old-account pointer to
                 # discarded_sid. Do not map the live child's sid back at shutdown.
                 if sess.retire_on_identity_change:
+                    continue
+                # A session started fresh over a WITHHELD mapping (adopted-transcript
+                # residue, ``_Session.resume_withheld``) is not that key's
+                # conversation: the mapping stays for the next open's recovery.
+                if sess.resume_withheld:
                     continue
                 cwd_str = sess.provider.cwd
                 if isinstance(sess.provider, acp_provider_type):

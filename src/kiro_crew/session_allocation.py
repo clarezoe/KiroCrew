@@ -1508,12 +1508,26 @@ class SessionAllocationService:
             )
 
         resume_sid: str | None = None
+        # A mapping that EXISTS but is withheld for this open (adopted-transcript
+        # residue after a failed move, see ``session_map.ResumeLookup``): the
+        # session started below is fresh, and its sid must never be promoted over
+        # that mapping -- the mapping is the only way back to the conversation,
+        # and the next open's recovery is what restores it.
+        resume_withheld = False
         is_stateless = (
             key in (constants.background_key, constants.heartbeat_key)
             or any(key.startswith(prefix) for prefix in constants.stateless_prefixes)
         ) and not owner._is_continuable_key(key)
         if not is_stateless:
-            resume_sid = owner._session_map.get(key)
+            from kiro_crew.session_map import resolve_resume_sid
+
+            # ``get`` is the cheap guarded liveness read; a transcript still in
+            # the host ``~/.kiro`` (an install that predates its isolated kiro
+            # home) is moved on a worker thread, outside the map lock, before
+            # the sid is handed to kiro-cli. A failed move leaves the mapping
+            # and the host pair in place for the next open.
+            lookup = await resolve_resume_sid(owner._session_map, key)
+            resume_sid, resume_withheld = lookup.sid, lookup.withheld
         if speculative and resume_sid and not speculative_resume:
             raise SpeculativeResumeRefused(key)
 
@@ -1887,11 +1901,12 @@ class SessionAllocationService:
                     self.state.capability_failures.pop(key, None)
                     replay_needed = getattr(provider, "_history_replay_needed", False) is True
                     provider_label = self._deps.provider_label(provider)
-                    defer_sid_promotion = (
+                    defer_sid_promotion = resume_withheld or (
                         replay_needed
                         and provider.defer_replay_sid_promotion is True
                         and provider_label == constants.provider_label_default
                     )
+                    session.resume_withheld = resume_withheld
                     if provider_switched or replay_needed:
                         session.provider_switch_replay = True
                     if replay_needed and provider_label != constants.provider_label_default:
@@ -1930,13 +1945,14 @@ class SessionAllocationService:
                             )
                         elif sid:
                             self._deps.logger.info(
-                                "Deferring fresh SID promotion for replay-pending "
-                                "session %s; prior resumable SID stays durable",
+                                "Deferring fresh SID promotion for %s session %s; prior "
+                                "resumable SID stays durable",
+                                "resume-withheld" if resume_withheld else "replay-pending",
                                 key,
                             )
                     elif not is_stateless and self._deps.is_claude_provider(provider):
                         sid = provider.session_id
-                        if sid:
+                        if sid and not resume_withheld:
                             owner._session_map.set(
                                 key,
                                 sid,

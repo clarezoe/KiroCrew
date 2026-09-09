@@ -573,12 +573,22 @@ def copy_file_pinned(
     force_mode: int | None = None,
     max_bytes: int | None = None,
     expected_src_ident: "tuple[int, int] | None" = None,
+    allow_multilink_source: bool = False,
     on_skip: SkipReporter = _noop_skip,
+    on_opened: "Callable[[os.stat_result], None] | None" = None,
     on_created: "Callable[[os.stat_result], None] | None" = None,
+    fsync: bool = False,
 ) -> bool:
     """Copy one file's bytes from a descriptor pinned to a validated inode.
 
     Returns True when bytes were copied, False when the source was skipped.
+
+    ``on_opened`` (when given) receives the destination descriptor's ``fstat``
+    immediately after the exclusive create. It is the identity witness a caller
+    needs to clean up only the name this attempt created when a later copy or
+    durability step fails. ``on_created`` remains the success-only witness,
+    called after bytes and metadata are complete. With ``fsync=True`` the
+    destination descriptor is synced before that success callback.
 
     ``skip_unreadable`` tolerates ONE failure: the SOURCE open being refused for
     permission, which is reported as ``SKIP_UNREADABLE_ENTRY`` and returns False.
@@ -597,6 +607,20 @@ def copy_file_pinned(
     OPENED inode, not that it is the inode the caller judged — a hardlink
     swapped in at the name between validation and this open would be a regular
     single-link file the other gates accept.
+
+    ``allow_multilink_source`` relaxes ONE screen, on the SOURCE only: a regular
+    file with more than one hard link is copied instead of reported as
+    ``SKIP_NOT_REGULAR``. The default screen refuses the alias because it is
+    a READ of bytes this call was not pointed at, judged on this function's own
+    first look at the inode. A caller that hands over its own validated
+    descriptor (*src_fd*) has already looked, and when that caller reads the
+    user's own home -- where ``rsnapshot``, ``rsync --link-dest`` and ``cp -al``
+    leave every file with a second name in the snapshot tree -- an alias names
+    bytes that same user can read by either name, so refusing it strands the
+    copy for nothing. The flag therefore requires *src_fd*; the by-name and
+    *dir_fd* forms keep the screen unconditionally. Nothing on the destination
+    side changes: exclusive create, ``O_NOFOLLOW``, ``fsync`` and the identity
+    witnesses are the same with or without it.
 
     ``on_created`` (when given) receives the DESTINATION descriptor's ``fstat``
     at publish time — the identity witness for a caller that must re-open the
@@ -650,6 +674,11 @@ def copy_file_pinned(
     """
     if dst is None and dst_name is None:  # pragma: no cover - caller bug
         raise ValueError("copy_file_pinned needs either dst or dst_name")
+    if allow_multilink_source and src_fd is None:
+        # The relaxed screen is for a caller that has already judged its own
+        # descriptor; on a by-name open THIS call is the first look, so it keeps
+        # the full screen.
+        raise ValueError("allow_multilink_source requires a caller-validated src_fd")
     # O_NONBLOCK is not about performance. Opening a FIFO for reading BLOCKS until a
     # writer appears, so without it a single named pipe -- in an extracted archive, or
     # planted in a staged tree -- hangs the whole snapshot or restore forever with no
@@ -707,10 +736,13 @@ def copy_file_pinned(
             # that omitted a wanted file read as complete and retention pruned on it.
             on_skip(SKIP_IDENTITY_CHANGED, by_name)
             return False
-        if not _stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        if not _stat.S_ISREG(st.st_mode) or (st.st_nlink != 1 and not allow_multilink_source):
             # Reached with a matching identity, or with none supplied: this is the same
             # inode the caller saw, or the first look at it, so a non-regular type or a
-            # hardlink alias here is the design screen and not a swap.
+            # hardlink alias here is the design screen and not a swap. The alias half
+            # is the one screen ``allow_multilink_source`` lifts, for a caller-validated
+            # descriptor on the user's own multiply-linked files; the type half never
+            # lifts.
             on_skip(SKIP_NOT_REGULAR, by_name)
             return False
         if max_bytes is not None and st.st_size > max_bytes:
@@ -771,6 +803,11 @@ def copy_file_pinned(
         # earlier form unlinked first and left the fragment exactly where cleanup was meant
         # to remove it, which my own Windows shard caught.
         try:
+            if on_opened is not None:
+                # Capture the inode while the exclusive-create descriptor is still
+                # open. A caller can later clean up this exact entry without trusting
+                # whichever inode may answer to the name after a failure.
+                on_opened(os.fstat(dst_fd))
             exceeded = False
             with os.fdopen(fd, "rb") as fsrc:
                 fd = -1  # ownership passed to the file object
@@ -816,6 +853,8 @@ def copy_file_pinned(
                 dst_name=dst_name,
                 mode=force_mode,
             )
+            if fsync:
+                os.fsync(dst_fd)
             if on_created is not None:
                 # Through the descriptor we still hold, so the witness is the
                 # published inode itself — never a name re-resolution.

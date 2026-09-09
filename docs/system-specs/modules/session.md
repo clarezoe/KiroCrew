@@ -1902,6 +1902,41 @@ no longer exists (the entry drops from memory immediately; the file write rides
 the deferred flush). `SessionMap.prune()` bulk-removes all stale entries at
 startup.
 
+**Adopted kiro home:** both stale paths stat `kiro_sessions_dir()`, which
+follows `KIRO_HOME`. When the CLI prologue gives a non-default `KIROCREW_HOME`
+its own kiro home ([config](config.md#kiro-home-of-a-non-default-data-home)),
+that directory is empty on the first start while the install's transcripts sit
+under the host `~/.kiro/sessions/cli`. Nothing moves them at startup. `get()` and
+`prune()` share one fence, `host_transcript_pending(sid)` (a single `lstat` of the
+host `<sid>.json`): a mapped sid whose pair is still host-side is answered as live,
+never pruned, and `get()` never copies. The move is per session, on open:
+`resolve_resume_sid(session_map, key)` — the resolver `_get_or_create_impl` calls
+in place of a bare `get()` — sees the pending fence and runs
+`resolve_host_transcript(sid)` on a worker thread, outside `_MAP_LOCK`. That call
+holds a per-sid lock across BOTH the attempt (`_migrate_adopted_transcript`) and
+the serve/withhold verdict, so a concurrent open of the same sid waits and then
+decides against the disk this attempt left. The attempt publishes the journal
+first and the state file last (`O_CREAT | O_EXCL | O_NOFOLLOW`, fsynced), retires
+the host pair only once the adopted pair is complete and durable, and only ever
+removes plain regular files. Recovery before every publish, while the complete
+host pair still exists, removes only what the host pair also holds: a regular
+file at an adopted name whose bytes are a prefix of (or equal to) the host file
+of the same name (`_is_prefix_copy`) is a stale partial, cleared and republished
+from the host pair; any other file at either name is left untouched and the open
+is withheld. The verdict is ONE predicate on the disk the attempt left
+(`_serve_verdict` → `_host_pair_complete`): a complete host pair still unmoved —
+after any failure, whatever it left at the adopted names — answers
+`ResumeLookup(None, withheld=True)`, because kiro-cli would find nothing at the
+adopted names, start fresh, and the fresh sid would replace the mapping; a host
+pair that is gone (migrated) or incomplete (no resumable journal) has nothing left
+to lose and the sid is served. The `MigrationOutcome` label (`MIGRATED`,
+`NOT_PENDING`, `FAILED`) only names the attempt in the log line. A withheld open
+starts a fresh session but never promotes its sid over the mapping
+(`_Session.resume_withheld` gates allocation's promotion, `close_all`'s persist
+and the replay commit), so the mapping and host pair survive for the next open's
+retry. Only sids present in this instance's map ever move; the move is a no-op
+unless `KIRO_HOME` equals the adopted path exactly.
+
 **Mapped-session enumeration:** `SessionMap.mapped_sids_by_key()` returns session
 key → kiro-cli session ID for every entry that has one. Disk accounting
 ([session-storage](session-storage.md)) needs both halves of that relation: the IDs

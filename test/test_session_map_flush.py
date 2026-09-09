@@ -169,6 +169,9 @@ class TestDeferredFlush:
         sessions_dir = tmp_path / "kiro-sessions"
         sessions_dir.mkdir()
         monkeypatch.setattr("kiro_crew.session_map._KIRO_SESSIONS_DIR", sessions_dir)
+        from kiro_crew import session_map as sm_mod
+
+        sm_mod._reset_adopted_source_cache()
         session_map.set("dashboard:stale", "sid-gone")
         session_map.flush()
         assert _map_file(tmp_path)["dashboard:stale"]["sid"] == "sid-gone"
