@@ -52,6 +52,8 @@ import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCir
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
+import MeetCrewmatesFlow, { MeetCrewmatesEligibilityNotice } from './components/MeetCrewmatesFlow'
+import { useMeetCrewmatesGate } from './hooks/useMeetCrewmatesGate'
 import AgentImportFlow from './components/AgentImportFlow'
 import ErrorNotice from './components/ErrorNotice'
 import PrivacyChapter from './components/PrivacyChapter'
@@ -1723,6 +1725,9 @@ export default function App() {
     window.addEventListener('mc-start-import', replay)
     return () => window.removeEventListener('mc-start-import', replay)
   }, [])
+  // Meet CrewMates: the crewmate first-run chapter, gated on zero crewmates +
+  // zero custom agents (see the hook).
+  const meetCrewmates = useMeetCrewmatesGate()
   // Capture Electron update lifecycle events app-wide so UpdateModal fires on
   // any page, not just after the user has opened Settings > About.
   useUpdateSubscription()
@@ -4278,7 +4283,16 @@ export default function App() {
           onComplete={endFirstRun}
           onSkipAll={endFirstRun}
         />
+        {/* First-run chapter 4 — Meet CrewMates. Fires once, after the tour,
+            only for a user with no crewmates and no custom agents; also
+            reopened from the Crewmates page (mc-start-meet-crewmates). */}
+        <MeetCrewmatesFlow open={meetCrewmates.open} onDone={meetCrewmates.onDone} onCreated={meetCrewmates.onCreated} persistFailed={meetCrewmates.persistFailed} />
       </OnboardingShellHost>
+      {meetCrewmates.eligibilityError && !meetCrewmates.open && (
+        /* The Meet CrewMates eligibility read failed, so the chapter cannot
+           decide whether to fire. Said here rather than swallowed. */
+        <MeetCrewmatesEligibilityNotice onDismiss={meetCrewmates.dismissEligibilityError} />
+      )}
 
       {/* Mobile backdrop — opacity is animated by animateDrawer in lockstep
           with the panel (compositor), so there is no framer fade here; it
