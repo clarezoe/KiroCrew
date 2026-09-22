@@ -10887,7 +10887,7 @@
       "collapse_sessions_this_one_opened": "Replier les sessions ouvertes par celle-ci",
       "expand_sessions_this_one_opened": "Déplier les sessions ouvertes par celle-ci",
       "sessions_this_one_opened": "Sessions ouvertes par celle-ci",
-      "nesting_depth": "Profondeur d'imbrication\u202f: {{depth}}",
+      "nesting_depth": "Profondeur d'imbrication : {{depth}}",
       "opened_by_session": "Ouverte par {{slot}}",
       "opened_by_closed_session": "Ouverte par {{slot}} (fermée)",
       "no_conductor_sessions_yet": "Aucune session chef d'orchestre pour l'instant",
@@ -11034,7 +11034,11 @@
       "opens_here_runs_on_instance": "Ouvre cette session ici — son exécution continue sur {{name}}",
       "opens_on_crew_switches_there": "S'ouvre sur {{name}} — bascule vers ce Crew, pas ici",
       "remote_instances_list_unavailable": "Impossible de lister les crews distantes, leurs sessions ne sont donc pas affichées.",
-      "model_list_failed": "Impossible de charger la liste des modèles. Ce qui est affiché peut être incomplet ou obsolète."
+      "model_list_failed": "Impossible de charger la liste des modèles. Ce qui est affiché peut être incomplet ou obsolète.",
+      "show_subagent_sessions": "Afficher les sessions de sous-agents",
+      "all_subagent_sessions_hidden_one": "{{count}} session de sous-agent masquée. Affiche les sessions de sous-agents pour la voir.",
+      "all_subagent_sessions_hidden_many": "{{count}} de sessions de sous-agents masquées. Affiche les sessions de sous-agents pour les voir.",
+      "all_subagent_sessions_hidden_other": "{{count}} sessions de sous-agents masquées. Affiche les sessions de sous-agents pour les voir."
     },
     "connectionsPage": {
       "action_failed": "Échec de l’action : {{error}}",
