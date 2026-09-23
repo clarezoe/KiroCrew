@@ -2446,6 +2446,11 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # behavior (not a display pref), read by the prevent-sleep poll in
     # dashboard/server.py; off by default.
     "dashboard.prevent_sleep": {"type": "bool"},
+    # Reply threads on crewmate chat messages. Read live by
+    # ``dashboard/chat_threads.py`` (routes) and ``dashboard/ws.py`` (the
+    # thread frame); off by default, and the Settings toggle under Crewmates is
+    # the only dashboard door to it.
+    "dashboard.crewmate_threads": {"type": "bool"},
     # Whether the credit pill may fall back to a BILLED `kiro-cli /usage` chat
     # turn when the free usage API returns no plan. Read by
     # ``handlers/sessions._text_scrape_enabled`` (fail-closed) and off by

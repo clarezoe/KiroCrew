@@ -3037,6 +3037,17 @@ class DashboardConfig:
             restart=True,
         ),
     )
+    crewmate_threads: bool = field(
+        default=False,
+        metadata=_meta(
+            "Reply threads on crewmate chat messages",
+            "Let any message in a crewmate's chat carry its own reply thread, "
+            "opened in the side panel while the main chat stays visible. Off by "
+            "default: the thread routes answer not-found, no thread frame is sent, "
+            "and the dashboard draws no Reply in thread control. Takes effect on "
+            "the next request; no restart.",
+        ),
+    )
     qr_session_until_restart: bool = field(
         default=True,
         metadata=_meta(

@@ -24,7 +24,8 @@ from chat_test_helpers import _make_state
 
 from kiro_crew import history_projection, platform_compat
 from kiro_crew.acp_backends import ACP_BACKEND_KIRO
-from kiro_crew.dashboard import chat_threads
+from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.dashboard import chat_threads, ws
 from kiro_crew.dashboard.chat_threads import (
     THREAD_BOUNDARY_PROMPT,
     THREAD_BOUNDARY_PROMPT_NO_TOOLS,
@@ -39,6 +40,7 @@ from kiro_crew.dashboard.chat_threads import (
 )
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.side_readonly_spec import PublishedSpec, ReadOnlySpecError
+from kiro_crew.dashboard.ws import broadcast_thread_reply
 from kiro_crew.history import ThreadStoreUnreadable
 from kiro_crew.members import DM_SLOT_MODE
 
@@ -145,6 +147,75 @@ def _no_carry_over():
     chat_threads._in_flight.clear()
     yield
     chat_threads._in_flight.clear()
+
+
+def _prime_threads_flag(enabled: bool) -> None:
+    """Publish ``dashboard.crewmate_threads`` as the live snapshot the routes and
+    the WS frame read; the process watcher is reset around every test."""
+    from kiro_crew.config import live
+
+    cfg = KiroCrewConfig()
+    cfg.dashboard.crewmate_threads = enabled
+    live.reset_for_tests()
+    live.watch().prime(cfg)
+
+
+@pytest.fixture(autouse=True)
+def _threads_on():
+    """The feature is off by default; every test here is about what it does when
+    it is on. ``test_threads_off_*`` flips it back."""
+    _prime_threads_flag(True)
+    yield
+
+
+@pytest.mark.asyncio
+async def test_threads_off_hides_the_routes_and_sends_no_frame(tmp_path, monkeypatch):
+    """``dashboard.crewmate_threads`` is off by default. Off, the three routes
+    answer the anti-enumeration 404 (the app-refusal's shape, so the feature's
+    presence is not discoverable), nothing is stored, and the thread frame is
+    never sent -- also for a turn that was already running when the flag went
+    off."""
+    _prime_threads_flag(False)
+    state = _make_state(tmp_path)
+    events = _capture_broadcasts(state)
+    slot, mid = _member_slot(state)
+    calls = _stub_turn(monkeypatch)
+    async with _client(state) as client:
+        summary = await client.get(f"/api/chat/threads?slot={_MEMBER_SLOT}")
+        detail = await client.get(f"/api/chat/threads/{mid}?slot={_MEMBER_SLOT}")
+        reply = await client.post(
+            f"/api/chat/threads/{mid}/reply", json={"slot_key": _MEMBER_SLOT, "text": "hi"}
+        )
+        for resp in (summary, detail, reply):
+            assert resp.status == 404
+            assert await resp.json() == {"error": "not found", "code": "slot_not_found"}
+        # Byte-for-byte the app caller's refusal.
+        async with _client(state, app_name="other-app") as foreign:
+            _prime_threads_flag(True)
+            denied = await foreign.get(f"/api/chat/threads?slot={_MEMBER_SLOT}")
+            _prime_threads_flag(False)
+            assert denied.status == 404 and await denied.json() == await summary.json()
+    assert calls == []
+    assert _threads(state, slot) == {}
+    broadcast_thread_reply(
+        state, slot_key=slot.key, mid=mid, run_id="run-1", role="assistant", content="late"
+    )
+    assert events == []
+    # Back on: the same request is served.
+    _prime_threads_flag(True)
+    async with _client(state) as client:
+        assert (await client.get(f"/api/chat/threads?slot={_MEMBER_SLOT}")).status == 200
+    broadcast_thread_reply(
+        state, slot_key=slot.key, mid=mid, run_id="run-1", role="assistant", content="now"
+    )
+    assert [e[0] for e in events] == [ws.THREAD_REPLY_EVENT]
+
+
+def test_the_flag_is_off_by_default_and_editable_from_the_dashboard():
+    from kiro_crew.dashboard.handlers import core
+
+    assert KiroCrewConfig().dashboard.crewmate_threads is False
+    assert core._EDITABLE_CONFIG["dashboard.crewmate_threads"] == {"type": "bool"}
 
 
 def _stub_turn(monkeypatch):
