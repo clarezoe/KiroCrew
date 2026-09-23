@@ -8,6 +8,8 @@ POSIX-only tests are marked as such because the branches they exercise
 """
 
 import asyncio
+import contextlib
+import gc
 import json
 import logging
 import os
@@ -16,12 +18,14 @@ import stat
 import sys
 import types
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import kiro_crew.acp.client as acp_client
 from kiro_crew import model_registry as mr
+from kiro_crew.acp._dispatch import UNSERIALISABLE_SIBLING_VALUE
 from kiro_crew.acp.client import (
     AcpAuthRequired,
     AcpClient,
@@ -1819,3 +1823,268 @@ class TestAdvertisedModelCacheWiring:
         await client.set_model("gpt-5-codex")
         assert client._model == "gpt-5-codex"  # sent verbatim, no fold
         assert not (tmp_path / ".claude" / "settings.local.json").exists()
+
+
+# ── Encoder and decoder refusal on the client's dispatch-path frames ──
+
+
+@contextlib.contextmanager
+def _cyclic_gc_off():
+    """Hold cyclic GC off across a probe that runs at the recursion ceiling.
+
+    A collection landing in the tail of a ceiling-deep encode or decode runs
+    finalizers with almost no stack left, and a ``RecursionError`` raised out of
+    a finalizer reaches the unraisable hook, which fails the whole worker with no
+    named test. Collect first so the window starts empty, and restore whatever
+    state the caller had in ``finally``.
+    """
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+        gc.collect()
+
+
+def _too_deep_to_encode(**dumps_kwargs: Any) -> Any:
+    """The shallowest nesting THIS interpreter's encoder refuses for *dumps_kwargs*.
+
+    The depth is probed rather than hard-coded because the two encoders have
+    different ceilings and both move between interpreter versions: ``indent=2``
+    runs the pure-Python encoder, which spends several frames per level, and a
+    ``default=str`` call runs the C one. A hard-coded depth can be encodable on
+    another interpreter, and the test then passes having refused nothing.
+    """
+    with _cyclic_gc_off():
+        depth = 1000
+        while depth <= 262144:
+            payload: Any = {"leaf": "deep"}
+            for _ in range(depth):
+                payload = {"nested": payload}
+            try:
+                json.dumps(payload, **dumps_kwargs)
+            except RecursionError:
+                return payload
+            depth *= 2
+    raise AssertionError("no nesting up to 2**18 is refused by json.dumps")
+
+
+def _nested_json_text(payload: Any) -> str:
+    """Serialise a probe payload to JSON text WITHOUT ``json.dumps``.
+
+    The JSONL sites need this: the encoder is what refuses the payload, so the
+    fixture cannot use it to write the file the reader parses.
+    """
+    depth = 0
+    node = payload
+    while isinstance(node, dict) and "nested" in node:
+        depth += 1
+        node = node["nested"]
+    return '{"nested": ' * depth + json.dumps(node) + "}" * depth
+
+
+def _too_deep_to_decode() -> str:
+    """JSON text nested past THIS interpreter's DECODER ceiling.
+
+    Probed for the same reason as the encoder depth, and a separate probe because
+    the decoder's ceiling is the higher of the two: text the encoder refuses is
+    still ordinary input to ``json.loads``.
+    """
+    with _cyclic_gc_off():
+        depth = 1000
+        while depth <= 262144:
+            text = "[" * depth + "]" * depth
+            try:
+                json.loads(text)
+            except RecursionError:
+                return text
+            depth *= 2
+    raise AssertionError("no nesting up to 2**18 is refused by json.loads")
+
+
+class TestClientEncodeRefusalDegrades:
+    """Every backend-shaped frame the JSON codec refuses costs ONE frame's
+    detail, never the agent turn and never a whole batch of tool results.
+
+    ``RecursionError`` subclasses ``RuntimeError``, so an unguarded
+    ``json.dumps`` does not catch it and neither does an
+    ``except (TypeError, ValueError)`` arm or an ``except json.JSONDecodeError``
+    arm. The agent backend chooses the shape of every ``rawInput`` /
+    ``rawOutput`` these sites serialise, so a payload past the codec's ceiling is
+    always reachable: unguarded, the raise escapes frame rendering and aborts the
+    whole turn. Same refusal posture as the ``_dispatch`` encodes, and the
+    placeholder is visible in the transcript on purpose, so the user can see that
+    detail is missing.
+    """
+
+    def test_tool_call_input_degrades(self, tmp_path):
+        client = _client(tmp_path)
+        msg = _notify(
+            "session/update",
+            {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "deep-call",
+                    "kind": "other",
+                    "title": "Reading a pathological payload",
+                    "rawInput": _too_deep_to_encode(indent=2),
+                }
+            },
+        )
+
+        event = client._extract_tool_event(msg)
+
+        assert event is not None and event.kind == EVENT_TOOL_CALL
+        assert event.tool_input == UNSERIALISABLE_SIBLING_VALUE
+
+    def test_json_envelope_output_degrades(self, tmp_path):
+        client = _client(tmp_path)
+        msg = _notify(
+            "session/update",
+            {
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "deep-json",
+                    "status": "completed",
+                    "rawOutput": {"items": [{"Json": _too_deep_to_encode(default=str)}]},
+                }
+            },
+        )
+
+        event = client._extract_tool_call_update(msg)
+
+        assert event is not None and event.kind == EVENT_TOOL_RESULT
+        assert event.tool_output == UNSERIALISABLE_SIBLING_VALUE
+
+    def test_raw_output_passthrough_degrades(self, tmp_path):
+        # No ``items`` key: the unstructured passthrough branch, which serialises
+        # the whole ``rawOutput`` object.
+        client = _client(tmp_path)
+        msg = _notify(
+            "session/update",
+            {
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "deep-passthrough",
+                    "status": "completed",
+                    "rawOutput": _too_deep_to_encode(default=str),
+                }
+            },
+        )
+
+        event = client._extract_tool_call_update(msg)
+
+        assert event is not None and event.kind == EVENT_TOOL_RESULT
+        assert event.tool_output == UNSERIALISABLE_SIBLING_VALUE
+
+    def test_refinement_input_degrades(self, tmp_path):
+        # The refinement input is the site whose own arm catches
+        # ``(TypeError, ValueError)``, which this class of refusal walks straight
+        # through, so the helper is what has to carry it.
+        client = _client(tmp_path)
+        msg = _notify(
+            "session/update",
+            {
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "deep-refine",
+                    "title": "grep",
+                    "rawInput": _too_deep_to_encode(indent=2),
+                }
+            },
+        )
+
+        event = client._extract_tool_call_refinement(msg)
+
+        assert event is not None and event.kind == EVENT_TOOL_CALL_UPDATE
+        assert event.tool_input == UNSERIALISABLE_SIBLING_VALUE
+
+    def test_jsonl_json_result_degrades(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(acp_client, "kiro_sessions_dir", lambda: tmp_path)
+        deep_text = _nested_json_text(_too_deep_to_encode(indent=2))
+        # The decoder has to accept what the encoder refuses, or the fixture
+        # never reaches the site under test.
+        assert isinstance(json.loads(deep_text), dict)
+        line = (
+            '{"kind": "ToolResults", "data": {"content": [{"kind": "toolResult",'
+            ' "data": {"toolUseId": "t-deep", "content": [{"kind": "json",'
+            ' "data": ' + deep_text + "}]}}]}}\n"
+        )
+        (tmp_path / "sid.jsonl").write_text(line, encoding="utf-8", newline="\n")
+        client = _client(tmp_path)
+        client._session_id = "sid"
+
+        results = client._read_new_tool_results_sync()
+
+        assert [(r.tool_call_id, r.tool_output) for r in results] == [
+            ("t-deep", UNSERIALISABLE_SIBLING_VALUE)
+        ]
+
+    def test_jsonl_batch_keeps_the_sibling_and_its_4000_char_bound(self, tmp_path, monkeypatch):
+        """One refused frame costs that frame, and the per-part bound holds.
+
+        The guard wraps the encode, so the ``[:4000]`` cut still applies to what
+        the encode returns. Driven as a BATCH because that is where the cost of
+        an unguarded refusal lands: it reaches the method's catch-all arm, which
+        takes this result and every later one in the same read with it, while the
+        file offset has already advanced past them.
+        """
+        monkeypatch.setattr(acp_client, "kiro_sessions_dir", lambda: tmp_path)
+        wide = {f"key{i:04d}": "v" * 32 for i in range(200)}
+        assert len(json.dumps(wide, indent=2)) > 4000
+        deep_text = _nested_json_text(_too_deep_to_encode(indent=2))
+        line = (
+            '{"kind": "ToolResults", "data": {"content": ['
+            '{"kind": "toolResult", "data": {"toolUseId": "t-deep",'
+            ' "content": [{"kind": "json", "data": ' + deep_text + "}]}},"
+            '{"kind": "toolResult", "data": {"toolUseId": "t-wide",'
+            ' "content": [{"kind": "json", "data": ' + json.dumps(wide) + "}]}}"
+            "]}}\n"
+        )
+        (tmp_path / "sid.jsonl").write_text(line, encoding="utf-8", newline="\n")
+        client = _client(tmp_path)
+        client._session_id = "sid"
+
+        results = client._read_new_tool_results_sync()
+
+        assert [r.tool_call_id for r in results] == ["t-deep", "t-wide"]
+        assert results[0].tool_output == UNSERIALISABLE_SIBLING_VALUE
+        assert results[1].tool_output == json.dumps(wide, indent=2)[:4000]
+        assert len(results[1].tool_output) == 4000
+
+    def test_jsonl_undecodable_line_costs_only_that_line(self, tmp_path, monkeypatch):
+        """The decode half of the same read carries the same refusal class.
+
+        ``json.loads`` is guarded by ``json.JSONDecodeError``, a ``ValueError``,
+        which this class is not: a line past the decoder's ceiling that reaches
+        the method's catch-all arm takes every LATER line's results with it,
+        because the saved file offset has already moved past the bad line.
+        """
+        monkeypatch.setattr(acp_client, "kiro_sessions_dir", lambda: tmp_path)
+        good = json.dumps(
+            {
+                "kind": "ToolResults",
+                "data": {
+                    "content": [
+                        {
+                            "kind": "toolResult",
+                            "data": {
+                                "toolUseId": "t-after",
+                                "content": [{"kind": "text", "data": "SURVIVES"}],
+                            },
+                        }
+                    ]
+                },
+            }
+        )
+        body = _too_deep_to_decode() + "\n" + good + "\n"
+        (tmp_path / "sid.jsonl").write_text(body, encoding="utf-8", newline="\n")
+        client = _client(tmp_path)
+        client._session_id = "sid"
+
+        results = client._read_new_tool_results_sync()
+
+        assert [(r.tool_call_id, r.tool_output) for r in results] == [("t-after", "SURVIVES")]
