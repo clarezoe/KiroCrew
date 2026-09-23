@@ -11,8 +11,13 @@ import pytest
 from aiohttp.test_utils import make_mocked_request
 
 from kiro_crew.dashboard.handlers.files import api_file_diff
+from kiro_crew.platform import redact_via_context as redact
 
 requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+
+# A documented placeholder, not a real credential: the redactor matches it anyway.
+PLACEHOLDER = "lp_your_token_here"
+BEARER_LINE = '"Authorization": "Bearer ' + PLACEHOLDER + '"'
 
 
 def _req(path: str = "") -> make_mocked_request:
@@ -383,3 +388,64 @@ async def test_sel_audit_logging_on_success(tmp_path):
     call_kwargs = mock_sel.log_api_access.call_args
     assert call_kwargs[1]["operation"] == "file_diff"
     assert call_kwargs[1]["outcome"] == "allowed"
+
+
+def _git_repo(tmp_path):
+    """Initialise a committable git repo in *tmp_path*."""
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, capture_output=True)
+
+
+def _credential_line(text: str) -> str:
+    """The single line of *text* mentioning the bearer header."""
+    return next(line for line in text.splitlines() if "Authorization" in line or "REDACTED" in line)
+
+
+@pytest.mark.asyncio
+@requires_git
+async def test_head_content_is_redacted_like_the_panel_buffer(tmp_path):
+    """An unchanged credential line must not render as a diff hunk.
+
+    The file panel's diff view puts ``api_file_read``'s already-redacted buffer
+    beside this endpoint's ``original`` and diffs the two strings itself. Serving
+    HEAD raw therefore invents a hunk on a line nobody touched, and leaks a
+    secret committed in HEAD that ``/api/file-read`` masks.
+    """
+    _git_repo(tmp_path)
+    f = tmp_path / "config.json"
+    f.write_text(BEARER_LINE + "\nkeep\n")
+    subprocess.run(["git", "add", "config.json"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, check=True)
+    # Edit an unrelated line, which is what opens the panel's diff view.
+    f.write_text(BEARER_LINE + "\nchanged\n")
+
+    with patch("kiro_crew.dashboard.handlers.files._sel", return_value=_mock_sel()):
+        resp = await api_file_diff(_req(str(f)))
+    body = json.loads(resp.body)
+
+    assert body["status"] == "modified"
+    assert PLACEHOLDER not in body["original"]
+    assert "[REDACTED: credential]" in body["original"]
+    # Both panes agree on the untouched line, so it renders as unchanged.
+    assert _credential_line(body["original"]) == _credential_line(redact(f.read_text()))
+
+
+@pytest.mark.asyncio
+@requires_git
+async def test_untracked_diff_is_redacted(tmp_path):
+    """The untracked branch's ``diff`` is the whole file, so it is redacted too."""
+    _git_repo(tmp_path)
+    (tmp_path / "init.txt").write_text("x")
+    subprocess.run(["git", "add", "init.txt"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, check=True)
+    f = tmp_path / "new.json"
+    f.write_text(BEARER_LINE + "\n")
+
+    with patch("kiro_crew.dashboard.handlers.files._sel", return_value=_mock_sel()):
+        resp = await api_file_diff(_req(str(f)))
+    body = json.loads(resp.body)
+
+    assert body["status"] == "untracked"
+    assert PLACEHOLDER not in body["diff"]
+    assert "[REDACTED: credential]" in body["diff"]
