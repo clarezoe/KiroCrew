@@ -96,3 +96,26 @@ describe('usePlanActionMutation stale-click guard', () => {
     expect(planAction).toHaveBeenCalledWith('slot-nokey', 'Cancel')
   })
 })
+
+/* `isRefused` is what both hosts feed the FULL followUpOptions row through, and
+ * a plan row is not necessarily plan-only — ChatPage's own handler routes
+ * non-protocol labels to the composer. So the latch class lookup has to be
+ * gated on `isPlanAction` first: without it every non-"cancel" label on the row
+ * (an "Approve" or a free-text suggestion) falls into the Go class and dims the
+ * moment a Go is held, refusing chips the dispatch never owned. */
+describe('usePlanActionMutation isRefused', () => {
+  it('refuses only plan labels in the held class, never a mixed row\'s other chips', async () => {
+    const { result } = renderHook(() => usePlanActionMutation('slot-refused', 'row-1'), { wrapper })
+    await act(async () => { result.current.mutate({ slot: 'slot-refused', action: 'Go', clickedSourceKey: 'row-1' }) })
+    expect(planAction).toHaveBeenCalledWith('slot-refused', 'Go')
+    // Go's class is held, so both of its labels are refused...
+    expect(result.current.isRefused('Go')).toBe(true)
+    expect(result.current.isRefused('Go All')).toBe(true)
+    // ...Cancel is a different class and stays live...
+    expect(result.current.isRefused('Cancel')).toBe(false)
+    // ...and a non-protocol label on the same row is not a plan action at all.
+    for (const label of ['Approve', 'Stage-1-APPROVE', 'Tell me more', '']) {
+      expect(result.current.isRefused(label)).toBe(false)
+    }
+  })
+})
