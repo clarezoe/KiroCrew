@@ -933,6 +933,18 @@ message's durable `meta.mid`. "Thread" is only ever this reply thread; the main
 conversation is the chat. Any message, the user's or the crewmate's, can carry
 one.
 
+**Flag.** The feature ships behind `dashboard.crewmate_threads` (`config/sections.py`,
+default `False`; editable from the dashboard, `handlers/core.py` `_EDITABLE_CONFIG`,
+and read live -- the config watcher's snapshot, else a load off the loop -- so a
+toggle takes effect on the next request without a restart). Off, the three routes
+below answer `404 {"error": "not found", "code": "slot_not_found"}` -- the same
+body the app-isolation refusal sends, so a caller cannot tell "threads are off"
+from "no such slot" -- before any read or write; nothing is stored, no turn runs,
+and `ws.broadcast_thread_reply` sends no `chat.thread_reply` frame (also for a
+turn that was already running when the flag went off, whose stored reply is
+served again once it is back on). The stored sidecar is untouched by the flag
+either way: turning threads off hides them, it does not delete them.
+
 **Storage.** Replies live in a sidecar beside the slot's transcript,
 `ConversationLog.threads_sidecar_path(key)` =
 `<sessions dir>/.threads/<safe key>.json`, keyed by the slot's transcript key
