@@ -20,6 +20,7 @@ from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from kiro_crew.kiro_prerequisite import identity_stamp_mismatch
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.metrics.sessions import (
     END_REASON_DESTROYED,
@@ -116,6 +117,8 @@ class _SessionMapPort(Protocol):
 class _BackgroundRuntime(Protocol):
     def has_active_or_initializing_sessions(self) -> bool: ...
 
+    def is_alive(self) -> bool: ...
+
     async def kill(self, expected: bool = False, reason: str = "") -> None: ...
 
 
@@ -150,6 +153,7 @@ class SessionLifecycleOwner(Protocol):
     _draining_bg_runtimes: list[_BackgroundRuntime]
     _subagent_runtimes: MutableMapping[str, _BackgroundRuntime]
     _subagent_runtime_locks: MutableMapping[str, asyncio.Lock]
+    _draining_subagent_runtimes: list[_BackgroundRuntime]
 
     _session_map: _SessionMapPort
 
@@ -188,6 +192,10 @@ class SessionLifecycleOwner(Protocol):
     async def _retire_kiro_bg_runtime(self) -> bool: ...
 
     async def _reap_drained_bg_runtimes_locked(self) -> None: ...
+
+    async def _detach_bg_runtime_locked(
+        self, runtime: _BackgroundRuntime, cause: str, *, park_only: bool = False
+    ) -> None: ...
 
     async def drain_active_turns(self, timeout: float | None = None) -> int: ...
 
@@ -1174,6 +1182,94 @@ class SessionLifecycleService:
             await owner.release_subagent_runtime(key)
             self._deps.logger.info("Removed session (map preserved): %s", key)
 
+    async def flag_identity_stamp_mismatches(self, live: str) -> list[str]:
+        """Mark sessions -- and retire idle companion runtimes -- whose child
+        PROVABLY spawned under a different account.
+
+        The consumer of the spawn-identity stamp
+        (``kiro_prerequisite.stamp_spawn_identity``): each kiro-backed provider
+        records the account the store held as its process started, and this
+        compares those records against *live* -- the fresh fingerprint the turn
+        gate just read. A mismatch means the child authenticated as an account
+        other than the one the store currently names, even when the baseline and the interim
+        latch both compare equal because no read ever observed the interim
+        (the A->B->A round trip a gateway-wide baseline is inherently blind
+        to).
+
+        Flag-only for sessions: it sets the existing ``retire_on_identity_change``
+        eviction flag -- the next acquire on that key reports the session
+        invalid and the stale-provider path recycles it -- and never touches
+        the sweep baseline, and never records anything sticky. That is the
+        loop guard: a wrong observation
+        here costs one targeted recycle of one session, not a
+        retire-until-complete sweep, and on a healthy host every stamp equals
+        *live* so this is a no-op per turn. Sessions with no stamp are skipped
+        (``identity_stamp_mismatch`` refuses them), keeping every unstamped
+        child on the pre-stamping protections rather than guessing.
+
+        Companion runtimes are not sessions: the background runtime and the
+        per-parent subagent runtimes hold their own kiro-backed processes,
+        carry the same spawn stamp, and never appear in ``owner._sessions``,
+        so the session scan cannot reach them. They have no per-session
+        eviction flag either, so a PROVEN mismatch retires an idle one through
+        the sweep's own idle-runtime reapers, narrowed by a predicate -- this
+        gate never calls ``release_subagent_runtime`` itself, keeping those
+        reapers the module's only such path outside the paired parent-end
+        sites. A busy runtime is never killed mid-turn (killing live
+        work is the defect this change exists to remove); instead the reapers
+        DISPLACE it out of the claimable slot -- popped from the registry (or
+        the ``_bg`` slot) and parked on a drain list -- so a new acquisition
+        spawns a replacement under the live account rather than demuxing
+        fresh sessions onto the wrong-account process, and the parked
+        runtime is killed by a later pass once its in-flight work drains.
+        """
+
+        if not live:
+            return []
+        owner = self._owner
+        flagged: list[str] = []
+        async with owner._lock:
+            for key, sess in owner._sessions.items():
+                if sess.retire_on_identity_change:
+                    continue
+                provider = sess.provider
+                if not self._deps.provider_uses_kiro_identity_store(provider):
+                    continue
+                stamp = getattr(provider, "spawn_identity", "") or getattr(
+                    getattr(provider, "_runtime", None), "spawn_identity", ""
+                )
+                if identity_stamp_mismatch(stamp, live):
+                    sess.retire_on_identity_change = True
+                    flagged.append(key)
+        # Companion runtimes, via the dedicated idle-runtime reapers rather
+        # than releasing here: those reapers are the module's only
+        # retirement path outside the paired parent-end sites, so the
+        # parent-end ratchet stays a single-exemption contract. The predicate
+        # narrows their reap to PROVEN wrong-account runtimes; busy runtimes
+        # are skipped inside the reapers exactly as the sweep skips them.
+
+        def _mismatched(runtime: object) -> bool:
+            return identity_stamp_mismatch(getattr(runtime, "spawn_identity", ""), live)
+
+        retired: list[str] = []
+        await self._retire_kiro_subagent_runtimes(should_retire=_mismatched, retired=retired)
+        flagged.extend(f"subagent-runtime:{parent_key}" for parent_key in retired)
+        bg_retired: list[str] = []
+        await self._retire_kiro_bg_runtime(
+            should_retire=_mismatched,
+            retired=bg_retired,
+            reason="spawn identity mismatch retirement",
+        )
+        flagged.extend(bg_retired)
+        if flagged:
+            self._deps.logger.info(
+                "Flagged %d holder(s) whose child spawned under a different "
+                "account than the live one: %s",
+                len(flagged),
+                ", ".join(sorted(flagged)),
+            )
+        return flagged
+
     async def retire_kiro_identity_sessions(self, fingerprint: str = "") -> tuple[list[str], bool]:
         """Retire idle Kiro-backed processes after an identity-store change.
 
@@ -1339,20 +1435,106 @@ class SessionLifecycleService:
                 complete = False
         return retired, complete
 
-    async def _retire_kiro_subagent_runtimes(self) -> bool:
-        """Retire idle Kiro-backed companion runtimes."""
+    async def _retire_kiro_subagent_runtimes(
+        self,
+        should_retire: Callable[[object], bool] | None = None,
+        retired: list[str] | None = None,
+    ) -> bool:
+        """Retire idle Kiro-backed companion runtimes.
+
+        This method is the module's ONLY companion-runtime retirement path
+        outside the paired parent-end sites: it reaps exclusively IDLE
+        runtimes, so it has no running child to end (the fact its ratchet
+        exemption in ``test_every_parent_end_release_site_ends_its_children``
+        rests on). Callers that need a narrower reap -- the spawn-identity
+        stamp gate retires only PROVEN wrong-account runtimes -- pass
+        ``should_retire`` rather than calling ``release_subagent_runtime``
+        themselves, which would widen that exemption.
+
+        ``should_retire`` filters which idle runtimes are reaped (``None``
+        retires every kiro-backed one -- identity-sweep semantics). The
+        sweep-quiescence post-conditions (spawn locks held, runtimes still
+        registered) only apply to the unfiltered sweep, since under a filter
+        the surviving runtimes are the expected outcome, not incompleteness.
+        ``retired`` collects the parent keys actually released.
+
+        Under a filter, a BUSY runtime the predicate proves wrong-account is
+        DISPLACED rather than skipped: popped from the claimable registry
+        (its per-parent spawn lock is dropped with it, so a waiter retries
+        against the live map and spawns a replacement under the live account)
+        and parked on ``_draining_subagent_runtimes`` until its in-flight
+        work finishes. Leaving it registered is the hole this closes: the
+        registry is what ``get_subagent_runtime`` hands to NEW demuxed
+        sessions, so "busy, catch it later" kept the wrong-account process
+        claimable for the whole drain. The park never kills -- the reap at
+        the top of this method kills a parked runtime only once it has no
+        active or initializing sessions (probes fail toward busy, preserving
+        work). The unfiltered sweep keeps its skip-busy contract untouched:
+        its completeness signal is what drives retries, and its busy sessions
+        are already flagged for next-turn retirement.
+        """
         owner = self._owner
         logger = self._deps.logger
         complete = True
+        # Reap parked displaced runtimes whose work has drained. Runs on
+        # every caller (the per-turn gate and the sweep), mirroring the bg
+        # drain reap at the top of _retire_kiro_bg_runtime.
+        remaining: list[Any] = []
+        for parked in owner._draining_subagent_runtimes:
+            try:
+                busy = parked.is_alive() and parked.has_active_or_initializing_sessions()
+            except Exception:
+                busy = True  # fail toward preserving work
+            if busy:
+                remaining.append(parked)
+                continue
+            try:
+                await parked.kill(expected=True, reason="drained identity displacement teardown")
+                logger.info("Reaped a drained displaced subagent runtime")
+            except Exception:
+                logger.warning(
+                    "Failed to reap a drained displaced subagent runtime; will retry",
+                    exc_info=True,
+                )
+                remaining.append(parked)
+        owner._draining_subagent_runtimes[:] = remaining
         for parent_key in list(owner._subagent_runtimes):
             runtime = owner._subagent_runtimes.get(parent_key)
             if runtime is None or not self._deps.provider_uses_kiro_identity_store(runtime):
                 continue
+            if should_retire is not None and not should_retire(runtime):
+                continue
             if runtime.has_active_or_initializing_sessions():
+                if should_retire is not None:
+                    # Proven wrong-account but busy: make it unclaimable NOW,
+                    # drain it in the park. Pop under the per-parent lock so
+                    # an in-flight get_subagent_runtime waiter re-checks the
+                    # canonical map instead of racing the displacement
+                    # (mirrors release_subagent_runtime's dance, minus the
+                    # kill).
+                    lock = owner._subagent_runtime_locks.get(parent_key)
+                    if lock is not None:
+                        async with lock:
+                            displaced = owner._subagent_runtimes.pop(parent_key, None)
+                            owner._subagent_runtime_locks.pop(parent_key, None)
+                    else:
+                        displaced = owner._subagent_runtimes.pop(parent_key, None)
+                    if displaced is not None:
+                        owner._draining_subagent_runtimes.append(displaced)
+                        if retired is not None:
+                            retired.append(parent_key)
+                        logger.info(
+                            "Parked the busy subagent runtime for %s to drain — "
+                            "spawn identity mismatch displacement",
+                            parent_key,
+                        )
+                    continue
                 complete = False
                 continue
             try:
                 await owner.release_subagent_runtime(parent_key)
+                if retired is not None:
+                    retired.append(parent_key)
             except Exception:
                 logger.warning(
                     "Failed to retire subagent runtime for %s after an identity change",
@@ -1360,19 +1542,39 @@ class SessionLifecycleService:
                     exc_info=True,
                 )
                 complete = False
-        if any(lock.locked() for lock in owner._subagent_runtime_locks.values()):
-            complete = False
-        # This post-condition catches a runtime installed after the snapshot but
-        # before its per-parent spawn lock was released.
-        if any(
-            runtime is not None and self._deps.provider_uses_kiro_identity_store(runtime)
-            for runtime in list(owner._subagent_runtimes.values())
-        ):
-            complete = False
+        if should_retire is None:
+            if any(lock.locked() for lock in owner._subagent_runtime_locks.values()):
+                complete = False
+            # This post-condition catches a runtime installed after the snapshot but
+            # before its per-parent spawn lock was released.
+            if any(
+                runtime is not None and self._deps.provider_uses_kiro_identity_store(runtime)
+                for runtime in list(owner._subagent_runtimes.values())
+            ):
+                complete = False
+            # A parked displaced runtime is still a live process authenticated
+            # under the old account; the sweep is not done until it drains.
+            if any(
+                self._deps.provider_uses_kiro_identity_store(runtime)
+                for runtime in owner._draining_subagent_runtimes
+            ):
+                complete = False
         return complete
 
-    async def _retire_kiro_bg_runtime(self) -> bool:
-        """Retire the idle Kiro-backed background runtime and drained holders."""
+    async def _retire_kiro_bg_runtime(
+        self,
+        should_retire: Callable[[object], bool] | None = None,
+        retired: list[str] | None = None,
+        reason: str = "deliberate logout teardown",
+    ) -> bool:
+        """Retire the idle Kiro-backed background runtime and drained holders.
+
+        ``should_retire`` filters the reap the same way as
+        :meth:`_retire_kiro_subagent_runtimes` (``None`` retires
+        unconditionally -- identity-sweep semantics); ``retired`` collects
+        ``"background-runtime"`` when the kill lands; ``reason`` labels the
+        kill for the process record.
+        """
         owner = self._owner
         logger = self._deps.logger
         async with owner._bg_runtime_lock:
@@ -1384,10 +1586,26 @@ class SessionLifecycleService:
             runtime = owner._bg_runtime
             if runtime is None or not self._deps.provider_uses_kiro_identity_store(runtime):
                 return complete
+            if should_retire is not None and not should_retire(runtime):
+                return complete
             if runtime.has_active_or_initializing_sessions():
+                if should_retire is not None:
+                    # Proven wrong-account but busy: free the slot NOW so the
+                    # next acquisition spawns under the live account, and park
+                    # the runtime on the existing drain list -- the reap above
+                    # kills it once its handles finish. Skipping here is the
+                    # hole this closes: ``_bg_runtime`` is the claimable slot,
+                    # so "busy, catch it later" kept the wrong-account process
+                    # serving NEW background sessions for the whole drain.
+                    await owner._detach_bg_runtime_locked(
+                        runtime, "spawn identity mismatch displacement"
+                    )
+                    if retired is not None:
+                        retired.append("background-runtime")
+                    return False
                 return False
             try:
-                await runtime.kill(expected=True, reason="deliberate logout teardown")
+                await runtime.kill(expected=True, reason=reason)
             except Exception:
                 logger.warning(
                     "Failed to retire the background runtime after an identity change",
@@ -1397,6 +1615,8 @@ class SessionLifecycleService:
             # Clear only after kill succeeds; otherwise retain the live-process
             # reference for the next retirement attempt.
             owner._bg_runtime = None
+            if retired is not None:
+                retired.append("background-runtime")
             logger.info("Retired the background runtime started under the previous account")
             return complete
 
@@ -1824,6 +2044,15 @@ class SessionLifecycleService:
                     key,
                     exc_info=True,
                 )
+        # Parked displaced runtimes are live processes outside the registry;
+        # shutdown ends them like every other holder.
+        parked_doomed = list(owner._draining_subagent_runtimes)
+        owner._draining_subagent_runtimes[:] = []
+        for parked in parked_doomed:
+            try:
+                await parked.kill(expected=True, reason="graceful shutdown")
+            except Exception:
+                logger.debug("close_all: displaced subagent runtime cleanup failed", exc_info=True)
 
         # Drain queued warm providers. This intentionally does not call the
         # public pool drain helper, whose informational log is not present on

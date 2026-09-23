@@ -1559,6 +1559,14 @@ class SessionManager:
         self._registry_state().subagent_runtime_locks = value
 
     @property
+    def _draining_subagent_runtimes(self) -> list["AcpRuntime"]:
+        return self._registry_state().draining_subagent_runtimes
+
+    @_draining_subagent_runtimes.setter
+    def _draining_subagent_runtimes(self, value: list["AcpRuntime"]) -> None:
+        self._registry_state().draining_subagent_runtimes = value
+
+    @property
     def _continuable_keys(self) -> set[str]:
         return self._registry_state().continuable_keys
 
@@ -1795,6 +1803,15 @@ class SessionManager:
         # Installed by the dashboard once its state exists (set_subagent_probe);
         # None means "no dashboard, so no children can be attached".
         self._subagent_probe: "Callable[[str], bool | Awaitable[bool]] | None" = None
+        # Installed by the dashboard once the Kiro prerequisite service exists
+        # (its ``read_spawn_identity``); None means "no identity store to stamp
+        # from" -- CLI entry points and tests -- and every spawn stays unstamped,
+        # which is the pre-stamping status quo. When wired, each kiro-backed
+        # provider records the account the store held as its process started,
+        # so the turn gate can retire a child that provably spawned under a
+        # different account than the live one even when no read ever observed
+        # the interim (see ``flag_identity_stamp_mismatches``).
+        self.spawn_identity_reader: "Callable[[], Awaitable[str]] | None" = None
         # Installed by the gateway once it owns this manager (set_injection_probe);
         # None means "no gateway, so no completion injection can be in flight".
         self._injection_probe: "Callable[[str], bool] | None" = None
@@ -2056,6 +2073,14 @@ class SessionManager:
         """Delegate reaping of drained displaced runtimes."""
         await self._background_runtime._reap_drained_bg_runtimes_locked()
 
+    async def _detach_bg_runtime_locked(
+        self, runtime: "AcpRuntime", cause: str, *, park_only: bool = False
+    ) -> None:
+        """Delegate freeing the ``_bg`` slot (kill idle / park busy to drain)."""
+        await self._background_runtime._detach_bg_runtime_locked(
+            cast(Any, runtime), cause, park_only=park_only
+        )
+
     async def _displace_bg_runtime_locked(
         self, runtime: "AcpRuntime", cached_backend: str, configured_backend: str
     ) -> None:
@@ -2234,7 +2259,9 @@ class SessionManager:
         to ``_collect_active_pids``:
 
         - ``self._subagent_runtimes`` — companion runtimes multiplexing a parent
-          session's subagents (alive for the parent's whole lifetime).
+          session's subagents (alive for the parent's whole lifetime), plus any
+          ``_draining_subagent_runtimes`` displaced by the spawn-identity gate
+          while their in-flight work finishes.
         - ``self._bg_runtime`` — the background runtime backing ``get_bg_session``
           (kirocrew-lite title-gen / memory consolidation), plus any
           ``_draining_bg_runtimes`` displaced by a backend switch or by
@@ -2246,7 +2273,10 @@ class SessionManager:
         runtimes contribute — a dead entry SHOULD be reaped. Returns a copy.
         """
         pids: set[int] = set()
-        for runtime in list(self._subagent_runtimes.values()):
+        for runtime in [
+            *self._subagent_runtimes.values(),
+            *self._draining_subagent_runtimes,
+        ]:
             try:
                 if runtime is not None and runtime.is_alive() and isinstance(runtime.pid, int):
                     pids.add(runtime.pid)
@@ -2682,6 +2712,10 @@ class SessionManager:
     async def retire_kiro_identity_sessions(self, fingerprint: str = "") -> tuple[list[str], bool]:
         """Retire idle processes that loaded a superseded Kiro identity."""
         return await self._lifecycle_boundary().retire_kiro_identity_sessions(fingerprint)
+
+    async def flag_identity_stamp_mismatches(self, live: str) -> list[str]:
+        """Mark sessions whose child provably spawned under a different account."""
+        return await self._lifecycle_boundary().flag_identity_stamp_mismatches(live)
 
     async def _retire_kiro_warm_pool(self) -> bool:
         """Delegate pooled-provider retirement after identity change."""
