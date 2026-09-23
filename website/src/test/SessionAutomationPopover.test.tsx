@@ -1105,6 +1105,30 @@ describe('SessionAutomationPopover', () => {
     expect(line.textContent?.trimEnd().endsWith('·')).toBe(false)
   })
 
+  it('carries a criterion at the arming bound in full, styled as its sibling rows', () => {
+    // The arming surface refuses anything past MAX_JUDGE_CRITERION_CHARS (500), so a
+    // criterion this long is the widest the render can ever be handed. It is shown
+    // whole rather than clipped: the owner reads back exactly the prose they armed,
+    // and the row carries its siblings' type contract so a long brief grows the
+    // popover the way every other wrapping row in it does.
+    const criterion = 'w'.repeat(500)
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: criterion, quiet_when: '', targets: [] },
+      judge_last_verdict: { outcome: 'quiet', evidence_items: 1, at: 1_800_000_500 },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    const line = screen.getByTestId('judge-line')
+    expect(line.textContent).toContain(criterion)
+    expect(line).toHaveTextContent('quiet')
+    expect(line.className).toContain('text-[11px]')
+    // This criterion is 500 characters with NO space in it, which is the input that
+    // makes the difference between wrapping and overflowing: without a break rule the
+    // row runs off the popover horizontally instead of growing it. A rendered capture
+    // of this exact case is attached to the pull request.
+    expect(line.className).toContain('break-words')
+  })
+
   it('draws no judge line for a loop whose row carries a cleared brief', () => {
     const record = normalizeAutomationRecord(judgeLoopRow({ judge: {} }))
     renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })

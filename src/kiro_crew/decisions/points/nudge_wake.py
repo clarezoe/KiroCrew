@@ -481,16 +481,22 @@ async def judge_tick(
         return irq.Verdict(irq.Outcome.FALLBACK, body="wake judge could not assemble its evidence")
     if trace is not None:
         trace["evidence_items"] = int(bounds.get("evidence_items") or 0)
+    if dropped:
+        # A target the collector could not read leaves this tick BLIND, and that is
+        # true whatever the other targets produced. Checked before the delta is looked
+        # at, because a blind tick beside a talkative one still has a nonempty delta:
+        # judging only what was readable would let a confident QUIET about target A
+        # suppress the turn that target B's unread rows might have needed. "We could
+        # not look" must never read as "we looked and it was calm", and one unread
+        # target is enough to make the reading incomplete.
+        return irq.Verdict(irq.Outcome.FALLBACK, body="wake judge could not read every target")
     if not state.get("since_last_tick"):
-        # An empty delta has three causes and only one of them is calm. A target the
-        # collector could not read leaves this tick blind; evidence the scrub or the
-        # budget shed entirely leaves it holding something it may not send. Both fire,
-        # because "we could not look" must never read as "we looked and it was calm".
-        # Every target read with nothing new on any of them IS the calm one, and it
-        # answers QUIET -- counted against the caller's quiet-streak floor, so a
-        # subject that simply stays silent still buys a delivered turn at the floor.
-        if dropped:
-            return irq.Verdict(irq.Outcome.FALLBACK, body="wake judge could not read every target")
+        # An empty delta that got this far was fully READ, so two causes remain and
+        # only one is calm. Evidence the scrub or the budget shed entirely leaves the
+        # tick holding something it may not send, which fires. Every target read with
+        # nothing new on any of them IS the calm one, and it answers QUIET -- counted
+        # against the caller's quiet-streak floor, so a subject that simply stays
+        # silent still buys a delivered turn at the floor.
         if evidence:
             return irq.Verdict(
                 irq.Outcome.FALLBACK, body="wake judge had no evidence it could send"
@@ -531,14 +537,27 @@ async def judge_tick(
     return map_answers(answers)
 
 
-def notice_line(verdict: irq.Verdict, answers: Answers | None, evidence_items: int) -> str:
+def notice_line(
+    verdict: irq.Verdict,
+    answers: Answers | None,
+    evidence_items: int,
+    brief: str = "",
+) -> str:
     """One transcript line saying what the judge decided, and on how much.
 
     Rendered for a human reading the tab, so a tick that spent no turn still
     leaves a trace of WHY. Probabilities, not prose: the numbers are what a
     reader needs to tell a confident quiet from a lucky one.
+
+    *brief* names which criteria the verdict was reached under -- the shipped
+    default or the owner's own. A reader debugging a criterion needs to know it
+    was the one actually asked: a quiet reached under the default is not evidence
+    that their own sentence works, and a wake under it is not theirs misfiring.
     """
-    parts = [f"Wake judge \u00b7 {verdict.outcome.value}"]
+    head = f"Wake judge \u00b7 {verdict.outcome.value}"
+    if brief:
+        head += f" ({brief} brief)"
+    parts = [head]
     readings = []
     for question_id in (Q_NEEDS_OWNER, Q_OUTCOME, Q_URGENCY):
         answer = _answer(answers, question_id)

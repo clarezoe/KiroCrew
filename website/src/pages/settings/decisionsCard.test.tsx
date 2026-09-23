@@ -146,7 +146,7 @@ const SCOPE_SWITCH: Record<string, string> = {
   compaction: 'Also send the conversation and tool-call inputs so Jev can score compaction',
   memory_text:
     'Also send snippets of recalled memories so Jev can drop the ones that do not help',
-  nudge_evidence: 'Also send what a waiting loop is watching so Jev can skip a turn',
+  nudge_evidence: 'Also send what a watching loop has found so Jev can skip a turn',
 }
 
 type ScopeName = 'tool_args' | 'compaction' | 'memory_text' | 'nudge_evidence'
@@ -1809,7 +1809,7 @@ describe('a refused scope write says so', () => {
     expect(note).toContain('the name and arguments of your tool calls')
     expect(note).toContain('the conversation and tool-call inputs')
     expect(note).toContain('short snippets of the memories recalled')
-    expect(note).toContain('the recent messages of the sessions a waiting loop is watching')
+    expect(note).toContain('the recent messages of the sessions a watching loop reads')
   })
 
   it('says WHICH switch could not be saved', async () => {

@@ -87,7 +87,7 @@ State (one object, ≤ 8 000 chars after scrubbing, oldest evidence dropped firs
 - `since_last_tick`: a list of evidence items, each `{source, kind, age_s, text}`
   where `source` names the collector and the target (`session:chat-1751`,
   `pr:kirodotdev/KiroCrew#12735`, `work-ledger:it_42`), `kind` is a closed set
-  (`transcript_tail`, `pr_checks`, `pr_comment`, `ledger_event`, `probe`),
+  (`transcript_tail`, `pr_checks`, `ledger_event`, `probe`),
   and `text` is bounded per item (1 000 chars).
 - `last_verdict`: the previous tick's answer and fingerprint, so a judge can see
   it already passed on this evidence once.
@@ -133,8 +133,12 @@ The tick runs in the gateway (in `AutoNudgeService`, same thread the PR probe
 uses), so collectors read in-process state; no tool call, no model.
 
 - `pr`: for each PR URL in the message or `judge.targets`, the existing
-  `PrWatchProbe` observation plus new review/issue comment bodies since the
-  last tick (bounded).
+  `PrWatchProbe` observation alone. Comment body TEXT stays out of this
+  evidence: the probe reduces each PR-level comment body to a fixed-width
+  fingerprint (`pr_comment_body_digest`) and keeps none of the prose, which is
+  what the `nudge_evidence` consent disclosure promises the owner. A collector
+  that carried comment text would widen egress past the category this point is
+  reviewed under, so it needs its own scope and its own disclosure first.
 - `session`: for each `chat-*` key in `judge.targets`, the transcript rows
   appended since the last tick, assistant and tool rows only, last status line
   first. Creator-only: the same check `session_read_message` applies. A target
@@ -167,9 +171,31 @@ goal-conductor skills are updated to author these two lines when arming, in
 plain words, from the loop's exit condition. Targets default to what the
 message names (PR URLs, `chat-*` keys); the explicit list adds or narrows.
 
-Without `judge`, the loop behaves exactly as today. With the preview off, a
-`judge` object is accepted, stored, and ignored, so an armed loop survives the
-switch being toggled.
+The object is optional, and its absence is not an opt-out. Once `nudge_evidence`
+is granted, every GATED loop is screened on each tick: one carrying no criteria
+of its own runs under a default brief -- wake when "the subject needs its owner: a
+blocker, a question or ruling addressed to it, a terminal state, or the loop
+message's own exit condition", quiet when "nothing new for the owner since the
+last tick". The loop's instruction is the tick's context, so that default reads
+the loop's own exit condition without restating it. An explicit `judge`
+overrides the default; a brief naming only `targets` keeps them and takes the
+default's sentences. Requiring a brief per loop made the saving opt-in, and the
+loops that need it most are armed by agents mid-task with no reason to spend the
+argument.
+
+Two bypasses, and they mean different things. A `gate=false` loop is never
+screened: its duty is to act WHILE its subject is quiet -- a heartbeat, a
+reviewer chase -- so suppressing a quiet tick would remove the work rather than
+the waste. `judge: false` is an owner who wants observation gating and no judge;
+an empty object is not that, it only drops the owner's own criteria.
+`monitor_watch` keeps its probe first and reaches the judge only for what the
+probe cannot type. The transcript notice names which brief a verdict was reached
+under, because a quiet under the default is not evidence that the owner's own
+sentence works.
+
+With the preview off, a `judge` object is accepted, stored, and ignored and no
+loop is screened, so an armed loop survives the switch being toggled and nothing
+changes until the scope is granted.
 
 ### 3.4 Providers
 

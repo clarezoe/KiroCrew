@@ -4323,7 +4323,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Quiet ticks before firing anyway",
-      "help": "How many QUIET verdicts in a row a loop may collect before the next tick fires regardless, so a judge that is wrong about a subject costs a late turn rather than silence. 0, the default, means inherit the shipped floor -- the same number the typed probe path uses, spelled once in the loop engine so the two cannot drift. A negative value also reads as inherit, and a value above the engine's ceiling is clamped down to it: config.json is writable by an auto-approved agent shell, so a floor no one chose must not be able to keep a loop quiet for long.",
+      "help": "How many QUIET verdicts in a row end the run of skipped turns. The Nth consecutive QUIET tick FIRES regardless of its own verdict, so this many quiet verdicts skip one fewer turn than the number suggests, and a judge that is wrong about a subject costs a late turn rather than silence. 0, the default, means inherit the shipped floor -- the same number the typed probe path uses, spelled once in the loop engine so the two cannot drift. A negative value also reads as inherit. This knob only ever SHORTENS the silence window: the shipped floor is the ceiling, and a larger value is clamped back down to it, because config.json is writable by an auto-approved agent shell and a raised floor would silence a watch with no new code, only a number.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0

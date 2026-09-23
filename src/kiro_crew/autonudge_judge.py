@@ -91,9 +91,13 @@ def parse_targets(spec: Mapping[str, Any] | None, message: str = "") -> list[str
     strings come from the owner's tool call.
     """
     raw: list[str] = []
+    narrowed = False
     if isinstance(spec, Mapping):
         listed = spec.get("targets")
         if isinstance(listed, (list, tuple)):
+            # The owner NARROWED the watch by naming a list, and that stands even if
+            # nothing in it survives the filter below.
+            narrowed = True
             raw = [str(item) for item in listed if isinstance(item, str)]
     out: list[str] = []
     for item in raw:
@@ -104,9 +108,15 @@ def parse_targets(spec: Mapping[str, Any] | None, message: str = "") -> list[str
             out.append(value)
         if len(out) >= MAX_TARGETS:
             break
-    if out:
+    if out or narrowed:
+        # ``narrowed`` alone is enough. An owner who named targets and had every one
+        # dropped -- a typo, a shape this build does not read -- must not be handed the
+        # message's subjects instead: that is a WIDER watch than the one they asked for,
+        # reading evidence from a session they never named. Answering no targets costs a
+        # turn every interval, because a spec naming none fires rather than suppressing,
+        # and spending a turn is the right direction to be wrong in.
         return out
-    # Nothing explicit, so read the instruction the way the design says: the targets
+    # No list at all, so read the instruction the way the design says: the targets
     # default to what the MESSAGE names. Both shapes, not just pull requests -- a
     # conductor's instruction names the sessions it patrols, and requiring those to be
     # repeated in ``targets`` would mean a brief that looks armed and watches nothing.
@@ -382,8 +392,16 @@ async def collect_evidence(
     """
     clock = point.now() if now_ts is None else now_ts
     evidence: list[dict[str, Any]] = []
-    dropped = 0
-    for target in list(targets)[:MAX_TARGETS]:
+    wanted = list(targets)
+    # Targets past the cap are NOT read, so they start the drop count rather than
+    # vanishing from it. The cap bounds how many authorizations and reads one tick
+    # performs, which is its job; what it must not do is make an incomplete reading
+    # look like a complete one. With this at zero, a message naming one target more
+    # than the cap allows would let a confident QUIET about the ones that fit suppress
+    # a turn the unread one might have needed -- the same fault as a target the
+    # collector could not read, arriving through a bound instead of a failure.
+    dropped = max(0, len(wanted) - MAX_TARGETS)
+    for target in wanted[:MAX_TARGETS]:
         try:
             if is_session_target(target):
                 if read_session is None:
@@ -457,6 +475,38 @@ def criteria_of(spec: Mapping[str, Any] | None) -> tuple[str, str]:
         wake[: point.MAX_CRITERION_CHARS] if isinstance(wake, str) else "",
         quiet[: point.MAX_CRITERION_CHARS] if isinstance(quiet, str) else "",
     )
+
+
+#: The brief a gated loop is screened under when its owner named none. Generic on
+#: purpose: it asks the one question every patrol loop shares -- does the subject need
+#: its owner this tick -- rather than anything about a particular subject, which is
+#: what the owner's own criterion is for.
+#:
+#: "the loop message's own exit condition" is readable because the instruction is
+#: passed to the judge as the tick's context, so a loop that says "stop when the PR is
+#: merged" has its exit condition in front of the judge without restating it here.
+DEFAULT_WAKE_WHEN = (
+    "the subject needs its owner: a blocker, a question or ruling addressed to it, "
+    "a terminal state, or the loop message's own exit condition"
+)
+DEFAULT_QUIET_WHEN = "nothing new for the owner since the last tick"
+
+#: Which brief a tick ran under, for the transcript notice. A reader has to be able to
+#: tell a verdict reached under their own criterion from one reached under the shipped
+#: default, because only the first is evidence that their criterion works.
+BRIEF_DEFAULT = "default"
+BRIEF_CUSTOM = "custom"
+
+
+def default_spec() -> dict[str, Any]:
+    """The default brief, fresh each call so a caller cannot mutate the shipped one.
+
+    No ``targets``: :func:`parse_targets` reads the loop's own instruction when a brief
+    names none, so the default inherits whatever subject the loop already names. A loop
+    whose message names no readable subject has nothing to observe, and its tick fires
+    as it does today rather than being screened against an empty reading.
+    """
+    return {"wake_when": DEFAULT_WAKE_WHEN, "quiet_when": DEFAULT_QUIET_WHEN}
 
 
 def verdict_record(verdict: Any, evidence_items: int) -> dict[str, Any]:

@@ -630,6 +630,35 @@ def _judge_authority(
         return LANE_JEV, False
 
 
+def judge_evidence_scope_granted(
+    *, session_key: str | None = None, config: Any | None = None
+) -> bool:
+    """Whether the owner granted :data:`JUDGE_POINT`'s OWN egress scope. Never raises.
+
+    Narrower than :func:`is_enabled` on this point, and deliberately so. ``is_enabled``
+    answers "could any lane serve a tick", which the LLM lane satisfies on the provider
+    key alone -- correct for a loop whose owner armed a brief, because
+    :func:`_judge_authority` documents that spec as half of that lane's authorization.
+    Screening a loop whose owner armed NOTHING has no such half, so it asks the
+    narrower question instead: did this owner grant this point's own egress category.
+
+    Composed from the same two primitives :func:`_judge_authority` uses -- the
+    endpoint consent read and :func:`_point_scope_granted` -- rather than a second
+    rule of its own. Fail-closed: anything unreadable answers False, which leaves the
+    tick firing exactly as an ungated timer would.
+    """
+    try:
+        cfg = config if config is not None else _snapshot()
+        if cfg is None:
+            return False
+        if not _consented_for(cfg, session_key, JUDGE_POINT):
+            return False
+        return _point_scope_granted(JUDGE_POINT, _consent.load_state())
+    except Exception as exc:
+        logger.debug("decisions: judge scope unreadable (%s)", type(exc).__name__)
+        return False
+
+
 def history_budget_chars(config: Any | None = None) -> int:
     """Characters of prior conversation this decision may carry. Never raises.
 

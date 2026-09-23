@@ -865,7 +865,14 @@ async def _structured_monitor_update(
     # objective as the transcript row), so it belongs with the legacy fields the
     # structured path refuses. Without it here, ``monitor_update`` would accept a
     # banner into the patch, drop it, and report success -- a silent no-op.
-    legacy_only = sorted(set(patch) & {"message", "max_cycles", "active", "banner"})
+    #
+    # ``judge`` is the same class and reaches this path the same way: the schema
+    # offers it on EVERY ``monitor_update``, so arming a structured monitor and then
+    # sending a brief is two ordinary steps. A structured monitor is probe-first and
+    # holds no brief, so the field has nowhere to go here -- and an owner who is told
+    # their criterion was armed, while every tick keeps firing on the typed probe
+    # alone, has no way to discover that from the acknowledgement.
+    legacy_only = sorted(set(patch) & {"message", "max_cycles", "active", "banner", "judge"})
     if legacy_only:
         raise _DirectiveDenied(
             "monitor_update cannot apply legacy fields to a structured monitor: "

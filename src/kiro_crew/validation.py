@@ -1370,7 +1370,11 @@ MONITOR_START_SCHEMA = ToolSchema(
         # banner cap is re-checked there -- what gets STORED is what needs bounding.
         # Accepted and stored even when the judge's consent scope is off, so an armed
         # loop survives the switch being granted later.
-        FieldSpec("judge", dict),
+        #
+        # ``bool`` is admitted because ``judge: false`` is the opt-out: a gated loop
+        # that names no brief is screened under the default, so refusing the judge
+        # needs a spelling of its own. Only ``false`` survives validate_judge_spec.
+        FieldSpec("judge", (dict, bool)),
     ],
 )
 
@@ -1386,12 +1390,27 @@ MAX_JUDGE_CRITERION_CHARS = 500
 #: owner believing they had armed a criterion the judge never received.
 JUDGE_SPEC_KEYS = frozenset({"targets", "wake_when", "quiet_when"})
 
+#: The normalised form of ``judge: false``. A RESERVED key, deliberately absent from
+#: :data:`JUDGE_SPEC_KEYS`, so the only spelling a caller has for the opt-out is the
+#: boolean: an owner writing ``{"off": true}`` by hand is refused as an unknown key
+#: rather than given a second way to say the same thing. The persisted loader keeps
+#: the key, because it has to reload what this function stored.
+JUDGE_OFF_KEY = "off"
+
+
+def judge_is_off(spec: object) -> bool:
+    """Whether *spec* is the stored opt-out rather than a brief. Never raises."""
+    return isinstance(spec, dict) and spec.get(JUDGE_OFF_KEY) is True
+
 
 def validate_judge_spec(raw: object) -> dict[str, object]:
     """One wake-judge brief, normalised and bounded, or raise :class:`ValidationError`.
 
-    ``{}`` for an absent brief, and an empty object is legal: that is how a judge is
-    taken off a live loop through ``monitor_update``.
+    ``{}`` for an absent brief. An empty object is legal and means "no criteria of my
+    own": a gated loop carrying one is screened under the DEFAULT brief, so an empty
+    object is not how the judge is taken off. ``judge: false`` is -- it normalises to
+    the reserved :data:`JUDGE_OFF_KEY` marker, which the tick reads as an explicit
+    bypass.
 
     Targets are bounded and de-duplicated but NOT resolved here -- whether a
     ``chat-*`` key names a readable session is an authorization question, answered
@@ -1400,8 +1419,18 @@ def validate_judge_spec(raw: object) -> dict[str, object]:
     """
     if raw is None:
         return {}
+    if raw is False:
+        return {JUDGE_OFF_KEY: True}
+    if raw is True:
+        # Refused rather than read as "use the default", because the default already
+        # applies to every gated loop that names no brief. Accepting it would give one
+        # meaning two spellings, and the owner who typed it is more likely to have
+        # meant the opt-out.
+        raise ValidationError(
+            "judge", "use false to bypass the judge; the default brief needs no argument"
+        )
     if not isinstance(raw, dict):
-        raise ValidationError("judge", "must be an object")
+        raise ValidationError("judge", "must be an object or false")
     unknown = sorted(set(raw) - JUDGE_SPEC_KEYS)
     if unknown:
         raise ValidationError("judge", f"unknown key(s): {', '.join(unknown)}")
@@ -1461,9 +1490,10 @@ MONITOR_UPDATE_SCHEMA = ToolSchema(
         # loop must not be updatable into a state monitor_start would refuse.
         FieldSpec("banner", str, max_len=MAX_BANNER_CHARS),
         # Same shape check as the arm side, and the same reason: revising a loop must
-        # not be a way to store a judge brief arming would have refused. An empty
-        # object clears the brief, which is how a judge is taken off a live loop.
-        FieldSpec("judge", dict),
+        # not be a way to store a judge brief arming would have refused. ``judge:
+        # false`` is what takes the judge off a live loop; an empty object only drops
+        # the owner's own criteria, and a gated loop then runs under the default.
+        FieldSpec("judge", (dict, bool)),
     ],
 )
 

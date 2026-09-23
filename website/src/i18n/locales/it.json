@@ -11603,7 +11603,7 @@
         "artifact_deploy_desc": "Pubblica un artefatto su un URL HTTPS pubblico nel tuo account AWS. Disattivato per impostazione predefinita: ogni distribuzione comporta costi sul tuo account e serve il contenuto su internet aperto.",
         "open_artifact_deploy": "Apri Artifact Deploy",
         "decisions_nudge_evidence": "Invia anche ciò che osserva un ciclo in attesa, così Jev può saltare un turno",
-        "decisions_nudge_evidence_desc": "Un ciclo che controlla qualcosa ogni pochi minuti sveglia l’assistente ogni volta, anche quando non è cambiato nulla. Questo invia ciò che osserva — gli ultimi messaggi dell’assistente di quelle sessioni e lo stato di qualsiasi pull request che nomina — a Jev, e chiede se questo giro merita di svegliare qualcuno. Jev può solo attendere o svegliare: non può mai terminare il ciclo, e se è lento o irraggiungibile il ciclo sveglia come oggi. Password e chiavi vengono sostituite prima di ogni invio. Legge le sessioni che il ciclo osserva, non quella in cui stai scrivendo. Disattivato per impostazione predefinita."
+        "decisions_nudge_evidence_desc": "Un ciclo che controlla qualcosa ogni pochi minuti sveglia l’assistente ogni volta, anche quando non è cambiato nulla. Questo invia ciò che osserva — gli ultimi messaggi dell’assistente di quelle sessioni e lo stato di qualsiasi pull request che nomina — a Jev, e chiede se questo giro merita di svegliare qualcuno. Jev può solo attendere o svegliare: non può mai terminare il ciclo, e se è lento o irraggiungibile il ciclo sveglia come oggi. Password e chiavi vengono sostituite prima di ogni invio. Legge le sessioni che il ciclo osserva, non quella in cui stai scrivendo."
       },
       "kiroSignInCard": {
         "title": "Accesso a Kiro",

@@ -1266,8 +1266,13 @@ def test_the_judge_is_advertised_to_the_model_on_both_monitor_tools(tool_name: s
     props = _schema_for(tool_name)["properties"]
     assert "judge" in props, f"{tool_name} does not advertise `judge`, so no agent can send one"
     judge = props["judge"]
-    assert judge["type"] == "object"
+    # Both shapes, because the field carries two kinds of answer: an object is the
+    # owner's own brief, and `false` is the bypass. A schema listing only the object
+    # makes the bypass unsendable, which is the same way the field itself once shipped
+    # unreachable.
+    assert judge["type"] == ["object", "boolean"]
     assert judge.get("description", "").strip(), "an undescribed object tells the model nothing"
+    assert "false" in judge["description"], "the bypass is unusable if the model is not told"
     assert set(judge["properties"]) == {"wake_when", "quiet_when", "targets"}
     for field in ("wake_when", "quiet_when"):
         assert judge["properties"][field]["type"] == "string"

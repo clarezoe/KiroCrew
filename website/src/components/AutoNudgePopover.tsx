@@ -604,8 +604,13 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
                 the outcome, the item COUNT and the time -- never the evidence, and
                 never a probability, which lives in the decisions log where the
                 thresholds are tuned. */}
+            {/* ``break-words`` because the criterion is the owner's own sentence and may hold a
+                token with no spaces in it -- a URL, a sha, a pasted blob. Without it such a
+                criterion does not wrap, it OVERFLOWS the popover horizontally. Wrapping
+                rather than clamping: the row shows the whole criterion on purpose, so the
+                owner can confirm what they armed. */}
             {judge.kind === 'armed' && (
-              <div className="text-muted text-[11px]" data-testid="judge-line">
+              <div className="text-muted text-[11px] break-words" data-testid="judge-line">
                 {i18nT(
                   judge.sense === 'wake'
                     ? 'components.autoNudgePopover.judge_wake_when'

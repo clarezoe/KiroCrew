@@ -11603,7 +11603,7 @@
         "artifact_deploy_desc": "Publica un artefacto en una URL HTTPS publica de tu propia cuenta de AWS. Desactivado por defecto: cada despliegue gasta dinero en tu cuenta y sirve el contenido en la internet abierta.",
         "open_artifact_deploy": "Abrir Despliegue de artefactos",
         "decisions_nudge_evidence": "Enviar también lo que observa un bucle en espera para que Jev pueda omitir un turno",
-        "decisions_nudge_evidence_desc": "Un bucle que comprueba algo cada pocos minutos despierta al asistente siempre, incluso cuando nada ha cambiado. Esto envía lo que observa — los últimos mensajes del asistente de esas sesiones y el estado de cualquier pull request que nombre — a Jev, y pregunta si esta ronda merece despertar a alguien. Jev solo puede esperar o despertar: nunca puede terminar el bucle, y si va lento o no responde, el bucle despierta como hoy. Las contraseñas y claves se sustituyen antes de enviar nada. Lee las sesiones que el bucle observa, no la que tú tienes abierta. Desactivado por defecto."
+        "decisions_nudge_evidence_desc": "Un bucle que comprueba algo cada pocos minutos despierta al asistente siempre, incluso cuando nada ha cambiado. Esto envía lo que observa — los últimos mensajes del asistente de esas sesiones y el estado de cualquier pull request que nombre — a Jev, y pregunta si esta ronda merece despertar a alguien. Jev solo puede esperar o despertar: nunca puede terminar el bucle, y si va lento o no responde, el bucle despierta como hoy. Las contraseñas y claves se sustituyen antes de enviar nada. Lee las sesiones que el bucle observa, no la que tú tienes abierta."
       },
       "kiroSignInCard": {
         "title": "Inicio de sesión en Kiro",

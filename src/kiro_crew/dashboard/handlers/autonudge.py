@@ -218,10 +218,15 @@ _MONITOR_WITHHELD_LEGACY_FIELDS = frozenset(
         #   own accounting, the same class as ``cycle_count``. The verdict is
         #   text-free by construction -- an outcome, an item COUNT and a timestamp --
         #   so it can be published without carrying anything the judge read.
+        # * ``judge_wake_pending`` is a bare boolean -- one owed turn, or none -- and
+        #   names nothing at all. Withheld anyway, for the reason ``judge_quiet_streak``
+        #   is: this route holds a structured monitor to the stricter line, and the
+        #   plain loop that has a popover to render gets it from ``_serialize``.
         "judge",
         "judge_cursors",
         "judge_quiet_streak",
         "judge_last_verdict",
+        "judge_wake_pending",
     }
 )
 

@@ -599,7 +599,7 @@ def schemas() -> list[dict[str, Any]]:
                         ),
                     },
                     "judge": {
-                        "type": "object",
+                        "type": ["object", "boolean"],
                         "description": (
                             "Optional WAKE JUDGE: say in plain words what is worth "
                             "waking this session for, and a cycle with nothing new "
@@ -614,8 +614,14 @@ def schemas() -> list[dict[str, Any]]:
                             "request's state. It never ends "
                             "the loop and it never silences one indefinitely — after "
                             "a run of quiet cycles one fires anyway — so a wrong "
-                            "answer costs a late turn, not a missed one. Omit it and "
-                            "the loop behaves exactly as it does today"
+                            "answer costs a late turn, not a missed one. You do not "
+                            "have to pass it: once the evidence scope is granted, a "
+                            "gated loop is screened on every cycle under a default "
+                            "brief that asks whether the subject needs its owner, and "
+                            "these two sentences REPLACE that default with your own. "
+                            "Pass `false` to bypass the judge entirely; a `gate=false` "
+                            "loop is never screened, since its duty is to act while "
+                            "its subject is quiet"
                         ),
                         "properties": {
                             "wake_when": {
@@ -738,12 +744,14 @@ def schemas() -> list[dict[str, Any]]:
                         ),
                     },
                     "judge": {
-                        "type": "object",
+                        "type": ["object", "boolean"],
                         "description": (
                             "Revise the WAKE JUDGE on this loop, or arm one on a loop "
                             "that has none. Pass the two sentences again to replace "
-                            "them; pass an empty object to REMOVE the judge, after "
-                            "which every cycle fires as a plain timer again. Omit it "
+                            "them; pass an empty object to drop your own criteria, "
+                            "after which a gated loop runs under the default brief; "
+                            "pass `false` to bypass the judge entirely, after which "
+                            "every cycle fires as a plain timer again. Omit it "
                             "to leave the current brief untouched. Revising resets "
                             "the quiet-cycle count and the read positions, because "
                             "both describe the brief you are replacing"
