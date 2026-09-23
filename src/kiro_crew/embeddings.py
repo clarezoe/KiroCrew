@@ -57,6 +57,7 @@ from typing import Any, BinaryIO, Callable, NamedTuple, Protocol
 from kiro_crew import asset_downloader
 from kiro_crew.config.loader import config_path
 from kiro_crew.config.paths import config_dir
+from kiro_crew.cpu_affinity import affinity_cpu_count
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.security import is_sensitive_path
 
@@ -1010,11 +1011,16 @@ def _embed_threads() -> int:
     this module does: the download thread and the backend factory must not pull
     in the full config dataclass import graph.
 
+    The count comes from :func:`kiro_crew.cpu_affinity.affinity_cpu_count`, not
+    ``os.cpu_count``: inside a cpuset (a container, a ``taskset``) the latter
+    reports the host's cores, so the cap below would compute from 64 on a
+    2-core allowance and hand llama.cpp the whole machine's worth of threads.
+
     An operator value OTHER than the declared :data:`_DEFAULT_EMBED_THREADS` is
-    honoured up to the host's CPU count. Default policy caps that default one
-    core BELOW the count instead, so a 2-vCPU host keeps a core for the event
-    loop rather than handing llama.cpp the whole box. It is a ceiling on the
-    default, not a replacement for it: a 16-core host still answers 4.
+    honoured up to that count. Default policy caps the default one core BELOW it
+    instead, so a 2-vCPU host keeps a core for the event loop rather than handing
+    llama.cpp the whole box. It is a ceiling on the default, not a replacement
+    for it: a 16-core host still answers 4.
 
     A raw value EQUAL to the default is default policy, not operator intent.
     ``MemoryConfig.embedding_threads`` is a dataclass field defaulting to 4 and
@@ -1024,7 +1030,7 @@ def _embed_threads() -> int:
     4 cannot be pinned on a host with 4 or fewer cores -- any other number can.
     """
     raw = _read_memory_config().get("embedding_threads")
-    cores = os.cpu_count()
+    cores = affinity_cpu_count()
     requested = raw if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0 else 0
     if requested and requested != _DEFAULT_EMBED_THREADS:
         return max(1, min(requested, cores or _DEFAULT_EMBED_THREADS))

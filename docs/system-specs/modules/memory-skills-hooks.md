@@ -1865,7 +1865,8 @@ Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kir
 
 **Shared embedding budget.** Native inference has one shared worker and model.
 The normal interactive default is four native threads, capped at one core below
-the host's CPU count and never below one thread, so the event loop keeps a core
+the count of CPUs the process may run on -- a container's CPU set, not the host's
+core count -- and never below one thread, so the event loop keeps a core
 wherever there is one to spare; background bulk work defaults to one. A normal-thread value equal to that four-thread default reads as
 the default policy rather than as operator intent, because a whole-document config
 save materializes it. Any other explicit normal or bulk thread setting is honored
