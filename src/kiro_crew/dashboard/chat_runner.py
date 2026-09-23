@@ -4260,23 +4260,34 @@ def _route_history_source(state: DashboardState, session_key: str) -> "Callable[
     return _rows
 
 
-#: The two spellings of "this slot names no model", which is what the picker's
-#: Auto row means and what a freshly dispatched worker slot carries. Compared
-#: against a stripped, lower-cased model so a hand-written ``"Auto"`` reads the
-#: same as the picker's own value.
-_JEV_ROUTE_AUTO_MODELS = ("", "auto")
+#: The one spelling of "the owner chose to name no model": the picker's Auto row.
+#: Compared against a stripped, lower-cased model so a hand-written ``"Auto"``
+#: reads the same as the picker's own value.
+#:
+#: ``""`` is deliberately NOT here. It is the opposite fact -- a slot nobody has
+#: picked for yet -- and it cannot arm routing, because the runtime overwrites it:
+#: the first session this slot opens backfills the provider's resolved model into
+#: ``slot.model`` (``_backfill_canonical_model``), and that backfill runs BEFORE
+#: this gate is read. A slot admitted on ``""`` is therefore already pinned by the
+#: time the question would be asked, so the turn never routed and the composer
+#: named a routing that did not happen.
+_JEV_ROUTE_AUTO_MODELS = ("auto",)
 
 
 def _jev_route_armed(slot: Any) -> bool:
     """Whether this slot's turns ask ``model.route`` which model to run on.
 
-    Two ways in, and they are the same answer to the same question -- "the owner
-    named no model for this session, so let Jev name one per turn":
+    Two ways in, and both are the OWNER saying "do not pin this session, let Jev
+    name a model per turn":
 
     * the owner picked the ``Auto (Jev)`` row, which survives as ``slot.jev_route``;
-    * the slot names no model at all (``auto``, or the empty string a freshly
-      dispatched worker slot carries) while the Jev preview is on, which is the
-      state the composer chip renders as ``Auto (Jev)``.
+    * the slot's model is ``auto`` -- the picker's inherit row, which the sentinel
+      pick also resolves to -- while the Jev preview is on, which is the state the
+      composer chip renders as ``Auto (Jev)``.
+
+    A slot that names NO model (``""``) is not armed. That value is not a choice,
+    it is the absence of one, and the runtime replaces it with the resolved model
+    before this gate is ever read (see :data:`_JEV_ROUTE_AUTO_MODELS`).
 
     In-memory only, so the turn gate can read it on the event loop and the switch
     can re-read it inside the model locks. Whether the PREVIEW is on is a keystone
@@ -11127,8 +11138,8 @@ async def _run_chat(
             await _probe_fallback_restore_for_slot(slot, client)
 
         # ── Jev model routing (decisions/points/model_route.py) ──
-        # For a slot that names no model -- the owner picked "Auto (Jev)", or the
-        # slot is on plain ``auto``/``""`` while the preview is on -- and only for a
+        # For a slot the owner chose not to pin -- the owner picked "Auto (Jev)", or
+        # the slot is on plain ``auto`` while the preview is on -- and only for a
         # NORMAL chat turn: `_crew_log_actor` is the turn's structural origin, so
         # cron deliveries, sub-agent turns, crew-relayed turns, app injections and
         # autonudge wakes are all excluded -- none has an owner watching the price
