@@ -36,6 +36,15 @@ def test_startup_memory_guard_uses_native_host_reader(monkeypatch, platform, fre
     assert subagent_mod.check_memory_available(min_gb=4.5) == (ok, free)
 
 
+def test_startup_memory_guard_admits_a_host_with_no_native_reader(monkeypatch):
+    """Neither Linux, macOS nor Windows means there is no reader for host memory,
+    so the guard must ADMIT. Blocking instead would refuse every spawn forever on
+    such a host, and back-pressure that cannot measure is not back-pressure."""
+    for name in ("LINUX", "WINDOWS", "MACOS"):
+        monkeypatch.setattr(subagent_mod.platform_compat, "IS_" + name, False)
+    assert subagent_mod.check_memory_available(min_gb=4.5) == (True, -1.0)
+
+
 def test_startup_memory_guard_respects_container_headroom(monkeypatch):
     import io
 

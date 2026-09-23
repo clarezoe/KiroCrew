@@ -1513,7 +1513,6 @@ class SessionMetadataProjection:
 
         # This hot one-line edit remains crash-atomic without paying for an
         # fsync while every other writer of the session is excluded.
-        import os
         import tempfile
 
         data = "".join(lines).encode("utf-8")

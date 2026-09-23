@@ -863,11 +863,12 @@ def check_memory_available(
     cgroup limit, returns (True, -1.0).
     """
     if path == "/proc/meminfo" and not platform_compat.IS_LINUX:
-        avail = (
-            _macos_available_memory_gb()
-            if platform_compat.IS_MACOS
-            else _windows_available_memory_gb() if platform_compat.IS_WINDOWS else -1.0
-        )
+        if platform_compat.IS_MACOS:
+            avail = _macos_available_memory_gb()
+        elif platform_compat.IS_WINDOWS:
+            avail = _windows_available_memory_gb()
+        else:
+            avail = -1.0
         return (True, -1.0) if avail < 0 else (avail >= min_gb, round(avail, 2))
     avail = -1.0
     try:

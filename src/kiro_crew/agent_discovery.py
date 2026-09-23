@@ -1188,11 +1188,12 @@ def agent_skill_globs(
             if strict and agent != "kirocrew":
                 raise SkillScopeResolutionError(f"Cannot resolve skill scope for agent {agent!r}")
             return []
-        directory = (
-            project_agents_dir(str(project_dir))
-            if winner.scope == SCOPE_PROJECT
-            else (agents_dir if agents_dir is not None else _kiro_agents_dir())
-        )
+        if winner.scope == SCOPE_PROJECT:
+            directory = project_agents_dir(str(project_dir))
+        elif agents_dir is not None:
+            directory = agents_dir
+        else:
+            directory = _kiro_agents_dir()
         path = directory / winner.filename
         data = _read_agent_spec(path, operation="agent_skill_globs", source="unknown")
         if strict and data is None:
@@ -1308,8 +1309,10 @@ def agent_welcome_message(
         if not project_dir:
             return ""
         directory = project_agents_dir(project_dir)
+    elif agents_dir is not None:
+        directory = agents_dir
     else:
-        directory = agents_dir if agents_dir is not None else _kiro_agents_dir()
+        directory = _kiro_agents_dir()
     data = _read_agent_spec(
         directory / winner.filename,
         operation="agent_welcome_message",

@@ -1035,14 +1035,16 @@ def file_lock(
         # strictly safer, and callers already run under `with`, so the fd is
         # cleaned up. `required` is kept for call-site intent and does not
         # change the outcome — both paths refuse to proceed lock-less.
-        ceiling = 0.0 if not wait else (_LOCK_TIMEOUT_SECS if timeout is None else timeout)
         # The waiting path with no explicit ceiling is called with no keyword, so
         # the default-argument call shape existing tests stub out is preserved.
         if not wait:
+            ceiling = 0.0
             acquired = _win_acquire_blocking(fd, timeout=0.0)
         elif timeout is None:
+            ceiling = _LOCK_TIMEOUT_SECS
             acquired = _win_acquire_blocking(fd)
         else:
+            ceiling = timeout
             acquired = _win_acquire_blocking(fd, timeout=timeout)
         if not acquired:
             if not wait:
