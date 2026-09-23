@@ -3292,17 +3292,63 @@ class TestTerminalWsIntegration:
             yield None
             return
 
-        real_bash = shutil.which("bash")
+        # Resolve Bash from a fixed set of system directories rather than the
+        # developer's PATH: a PATH-planted wrapper named ``bash`` is exactly the
+        # kind of interposer this fixture exists to keep away from the test
+        # payload, so selecting the shell through the ambient PATH would reopen
+        # that door. The trusted list still covers the ordinary developer host
+        # (``/bin`` and ``/usr/bin`` on Linux, ``/opt/homebrew/bin`` and
+        # ``/usr/local/bin`` for a Homebrew Bash on macOS), so the readiness
+        # marker branch keeps exercising the same real Bash.
+        _TRUSTED_BASH_PATH = os.pathsep.join(
+            (
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+                "/usr/sbin",
+                "/sbin",
+                # NixOS and Nix-managed hosts expose the system Bash here rather
+                # than under /bin or /usr/bin.
+                "/run/current-system/sw/bin",
+            )
+        )
+        real_bash = shutil.which("bash", path=_TRUSTED_BASH_PATH)
         if real_bash is None:
-            pytest.skip("a real Bash is required for POSIX PTY integration tests")
+            # This is an AUTOUSE fixture on the whole PTY-integration class, so a
+            # no-op or a skip here would silently hand the sibling tests back to
+            # the shipped resolver, which spawns ``$SHELL -l`` under the ambient
+            # HOME (the test harness pins KIROCREW_HOME, not HOME) -- exactly the
+            # side-effect this fixture exists to prevent, with no assertion left
+            # to witness it. Fail loudly instead: a host with no Bash in any
+            # trusted location must extend the list above, not run these tests
+            # unisolated.
+            raise RuntimeError(
+                "no Bash found in a trusted system location "
+                f"({_TRUSTED_BASH_PATH!r}); extend the trusted list for this host "
+                "rather than running the PTY integration tests unisolated"
+            )
 
         ambient_home = tmp_path / "ambient-home"
         ambient_home.mkdir()
         profile_sentinel = tmp_path / "ambient-profile-ran"
         profile_marker = b"__KIROCREW_AMBIENT_PROFILE_RAN__"
+        # The profile ALSO installs a PROMPT_COMMAND hook: a developer whose
+        # login profile sets PROMPT_COMMAND (e.g. an auto tmux attach, a
+        # `history -a`) is the exact case that must not fire inside the transport
+        # tests. A `--noprofile --norc` shell never sources this file, so neither
+        # the profile body nor the PROMPT_COMMAND it would install ever runs.
+        prompt_command_sentinel = tmp_path / "ambient-prompt-command-ran"
+        prompt_command_marker = b"__KIROCREW_AMBIENT_PROMPT_COMMAND_RAN__"
         (ambient_home / ".bash_profile").write_text(
             "printf '__KIROCREW_AMBIENT_PROFILE_RAN__\\n'\n"
             f": > {shlex.quote(str(profile_sentinel))}\n"
+            "export PROMPT_COMMAND="
+            + shlex.quote(
+                "printf '__KIROCREW_AMBIENT_PROMPT_COMMAND_RAN__\\n'; "
+                f": > {shlex.quote(str(prompt_command_sentinel))}"
+            )
+            + "\n"
         )
 
         shim_dir = tmp_path / "isolated-shell"
@@ -3320,6 +3366,12 @@ class TestTerminalWsIntegration:
         # exported hook; the dedicated preservation test installs its own value
         # after this fixture runs.
         monkeypatch.delenv("PROMPT_COMMAND", raising=False)
+        # An operator may export an ABSOLUTE HISTFILE from their own dotfiles.
+        # Pinning HOME does not contain it: Bash reads HISTFILE straight from the
+        # environment, and the interactive teardown flushes history on SIGHUP, so
+        # a stale absolute value would write these tests' commands outside
+        # tmp_path. Point it inside the temp home to keep the run self-contained.
+        monkeypatch.setenv("HISTFILE", str(ambient_home / ".bash_history"))
 
         def _profiles_are_under_test() -> bool:
             return os.environ.get("HOME") != ambient_home_text
@@ -3339,6 +3391,8 @@ class TestTerminalWsIntegration:
         yield {
             "marker": profile_marker,
             "sentinel": profile_sentinel,
+            "prompt_command_marker": prompt_command_marker,
+            "prompt_command_sentinel": prompt_command_sentinel,
             "shell": shim,
         }
 
@@ -3354,6 +3408,8 @@ class TestTerminalWsIntegration:
         _isolated_terminal_shell,
     ):
         """The ordinary integration shell cannot execute an ambient profile."""
+        isolation = _isolated_terminal_shell
+        assert isolation is not None
         cfg_file = tmp_path / "config.json"
         cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
         monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
@@ -3387,12 +3443,17 @@ class TestTerminalWsIntegration:
             if spawned is not None:
                 await terminal._kill_session(spawned)
 
-        isolation = _isolated_terminal_shell
-        assert isolation is not None
         assert ready_seen, "isolated Bash never emitted its readiness marker"
         assert registry["profile-isolation"].shell == str(isolation["shell"])
         assert isolation["marker"] not in bytes(output)
         assert not isolation["sentinel"].exists()
+        # A PROMPT_COMMAND set by the ambient login profile (e.g. a developer's
+        # auto tmux attach) must not fire either: --noprofile --norc never
+        # sources the profile that would export it.
+        assert isolation["prompt_command_marker"] not in bytes(
+            output
+        ), "the ambient profile's PROMPT_COMMAND ran inside the isolated shell"
+        assert not isolation["prompt_command_sentinel"].exists()
 
     @pytest.mark.asyncio
     async def test_ws_spawn_and_disconnect(self, monkeypatch, tmp_path):
