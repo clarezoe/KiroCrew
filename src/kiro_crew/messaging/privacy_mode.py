@@ -26,10 +26,18 @@ one-way dependency invariant in ``docs/system-specs/modules/messaging.md``):
 * ``source`` — the channel name, e.g. ``"slack"``. It is the audit label and
   nothing else: the SEL operation is ``f"{source}.{mode}_mode"`` and the event's
   ``source`` field is ``source`` verbatim.
-* ``sessions`` — the ``SessionManager``, used ONLY to reach the one
-  :class:`~kiro_crew.session_map.SessionMap` instance it owns, so the durable
-  flag cannot be clobbered by a second instance's save. Omit it and the mode is
-  in-memory only, which is also what a test double gets.
+* ``sessions`` — the ``SessionManager``. Supplying it makes the mode DURABLE, in
+  two records for two readers: the per-conversation flag in the one
+  :class:`~kiro_crew.session_map.SessionMap` instance it owns (so the durable
+  flag cannot be clobbered by a second instance's save), which is what
+  :func:`hydrate` restores the trackers from on every inbound message and which
+  keeps the entry alive through ``SessionMap.prune``; and ``memory_mode`` in the
+  session's own transcript header, the field every memory reader already
+  honours (``is_incognito_transcript``), so a transcript read never depends on
+  the map being loaded. Omit it and the mode is in-memory only, which is also
+  what a test double passing no ``sessions`` gets. The header write goes through
+  the default ``ConversationLog``: every production log reads the one configured
+  sessions directory, so it reaches the same file the channel writes.
 * ``notify`` — an awaitable that delivers one confirmation message on the
   channel. The text is :data:`NOTICE_TEMPORARY` / :data:`NOTICE_INCOGNITO`, held
   here so two channels cannot describe the same mode differently.
@@ -54,6 +62,7 @@ repeating the token.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections import OrderedDict
@@ -251,6 +260,56 @@ def _persist(sessions: object, session_key: str, mode: str) -> None:
         )
 
 
+async def _persist_transcript_mode(session_key: str, mode: str) -> None:
+    """Record *mode* as the transcript header's ``memory_mode``, best-effort.
+
+    The record the memory readers consult. The session map flag is what the
+    channel's own gate hydrates from and what keeps the map entry alive through
+    ``SessionMap.prune``; the transcript header is the field every memory reader
+    already refuses on (``is_incognito_transcript``, the consolidator's header
+    source, the dashboard's persisted probe, the consolidate route's own header
+    probe), and it lives WITH the Kiro Crew transcript -- the turns written
+    before the modifier -- so it travels with what it protects and is reclaimed
+    with it and not before. Two records rather than one because they answer two
+    readers: a transcript read must not depend on the map being loaded, and the
+    channel gate must not pay a transcript read per inbound message.
+
+    Upserted through ``ConversationLog.update_metadata_if``: a transcript that
+    does not exist yet gets a metadata-only line, and ``ConversationLog.append``
+    keeps an existing header, so the first row any later writer appends lands
+    under a header that already carries the mode. Tighten-only: the guard
+    admits the write only when *mode* is at least as strict as the header's
+    current mode, so ``!incognito`` typed after ``!temporary`` cannot re-enable
+    memory reads, and a header already carrying *mode* is rewritten unchanged.
+
+    The default ``ConversationLog`` reaches the same file the channel writes:
+    every production log reads the one configured sessions directory. Off the
+    loop, because ``update_metadata_if`` takes the transcript's cross-process
+    flock. Best-effort for the same reason ``_persist`` is: the in-memory mark
+    has already happened, so a failed header write leaves the session restricted
+    for this process and is logged, not raised.
+    """
+    from kiro_crew.history import ConversationLog
+
+    log = ConversationLog()
+
+    def _tighten_only(metadata: dict) -> bool:
+        return strictest([str(metadata.get("memory_mode") or ""), mode]) == mode
+
+    try:
+        await asyncio.to_thread(
+            log.update_metadata_if, session_key, {"memory_mode": mode}, _tighten_only
+        )
+    except Exception:
+        logger.warning(
+            "could not record %s mode in the transcript header of %s; "
+            "the session map flag holds it",
+            mode,
+            session_key,
+            exc_info=True,
+        )
+
+
 def strip_token(text: str, mode: str) -> tuple[str, bool]:
     """Remove *mode*'s standalone token from *text*.
 
@@ -319,14 +378,16 @@ async def apply_mode(
 
     Ordering is deliberate. The in-memory mark lands FIRST, before any await, so
     a concurrent inbound message on the same session cannot observe the session
-    as unrestricted after the user asked for privacy. The durable write, the
-    audit, the caller's hook and the notice follow.
+    as unrestricted after the user asked for privacy. The durable writes -- the
+    session-map flag, then the transcript header -- the audit, the caller's hook
+    and the notice follow.
     """
     if session_key in _tracker(mode):
         return False
     mark(mode, session_key)
     if sessions is not None:
         _persist(sessions, session_key, mode)
+        await _persist_transcript_mode(session_key, mode)
     sel().log_api_access(
         caller=caller,
         operation=f"{source}.{mode}_mode",

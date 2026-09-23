@@ -1900,7 +1900,11 @@ flush on a crash leaves a well-formed older map, never a truncated file.
 **Auto-prune:** `SessionMap.get()` auto-removes entries whose `.json` file
 no longer exists (the entry drops from memory immediately; the file write rides
 the deferred flush). `SessionMap.prune()` bulk-removes all stale entries at
-startup.
+startup. Both paths ask `_survives_prune`: an entry carrying a durable setting,
+a generation floor, a channel binding, or a `temporary` / `incognito` privacy
+flag loses only its dead `sid` and keeps the rest (see `_PRIVACY_FLAGS` in
+`session_map.py` for why a session-scoped privacy flag is kept -- it protects a
+transcript that outlives the provider session).
 
 **Mapped-session enumeration:** `SessionMap.mapped_sids_by_key()` returns session
 key → kiro-cli session ID for every entry that has one. Disk accounting

@@ -5293,8 +5293,11 @@
         "group_semantic_count": "Semantic ({{count}})"
       },
       "memoryTab": {
-        "consolidated_sessions_failed": "Consolidated {{succeeded}}/{{total}} sessions ({{failed}} failed)",
-        "controls_how_conversation_history_is_consolidate": "Controls how conversation history is consolidated into memory.",
+        "consolidated_sessions_failed": "Summarized {{succeeded}}/{{total}} sessions ({{failed}} failed)",
+        "consolidated_sessions_failed_skipped": "Summarized {{succeeded}}/{{total}} sessions ({{failed}} failed, {{skipped}} skipped as temporary or incognito)",
+        "consolidated_sessions_skipped": "Summarized {{succeeded}}/{{total}} sessions ({{skipped}} skipped as temporary or incognito)",
+        "controls_how_conversation_history_is_consolidate": "Controls how conversation history is summarized into memory.",
+        "failed_sessions_named": "Failed: <keys/>",
         "learned_user_preferences_coding_style_tools_work": "Learned user preferences (coding style, tools, workflows). Auto-updated by memory consolidation.",
         "lesson_already_covered": "An existing lesson already covers this ({{reason}}). Reword it to add something new.",
         "lesson_already_stored": "This lesson is already stored.",

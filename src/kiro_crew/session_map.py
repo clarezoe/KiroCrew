@@ -72,10 +72,21 @@ GENERATION_FLOOR_FIELD = "generation_floor"
 # Flags that are durable SETTINGS rather than session-scoped state, and so keep
 # their entry alive through :meth:`SessionMap.prune`. Membership is opt-in
 # BECAUSE immortality has a cost: an entry that prune can never collect is a row
-# the map carries forever, and every mutation rewrites the whole map. A flag
-# describing one session (Slack's ``temporary`` / ``incognito`` threads) must
-# stay collectable — one leaked row per such thread would grow without bound.
+# the map carries forever, and every mutation rewrites the whole map.
 _DURABLE_FLAGS = frozenset({MIRROR_OPT_OUT_FLAG})
+
+# The ``!temporary`` / ``!incognito`` privacy modes, spelled exactly as
+# ``messaging.privacy_mode`` names them (MODE_TEMPORARY / MODE_INCOGNITO; a test
+# pins the two spellings together). Session-scoped, yet they ALSO keep their entry
+# alive: the flag protects the conversation's Kiro Crew transcript -- the turns
+# written before the modifier -- which outlives the provider session whose
+# reclaimed file is what makes an entry stale, and a memory reader that finds
+# the entry gone reads the thread as persistent and consolidates it. The
+# modifier stamps ``memory_mode`` into that transcript's header as well, but for
+# a thread flagged before the header carried the mode the entry is the ONLY
+# record. The growth this buys is one row per private thread ever flagged, the
+# same order as the Slack thread bindings the map already keeps for good.
+_PRIVACY_FLAGS = frozenset({"temporary", "incognito"})
 
 # How long a deferred flush waits before serializing, so a burst of mutations
 # (a subagent wave calling ``set`` once per spawn) collapses into one write
@@ -87,11 +98,15 @@ _FLUSH_DEBOUNCE_SECS = 0.05
 
 
 def _has_durable_flag(entry: dict) -> bool:
-    """True iff *entry* carries a flag that must outlive its native session."""
+    """True iff *entry* carries a flag that must outlive its native session.
+
+    A durable SETTING (:data:`_DURABLE_FLAGS`) or a privacy mode
+    (:data:`_PRIVACY_FLAGS`); see each set for why.
+    """
     flags = entry.get("flags")
     if not isinstance(flags, dict):
         return False
-    return any(flags.get(name) for name in _DURABLE_FLAGS)
+    return any(flags.get(name) for name in _DURABLE_FLAGS | _PRIVACY_FLAGS)
 
 
 def _survives_prune(entry: dict) -> bool:
@@ -1157,10 +1172,11 @@ class SessionMap:
         message from the channel opens a fresh session instead of resuming the
         one it is bound to.
 
-        Session-SCOPED flags (a temporary or incognito thread) are deliberately
-        NOT durable: they describe one session, so keeping their entries alive
-        would leak a never-collected row per such thread and grow the map — which
-        every mutation rewrites — without bound.
+        A privacy-mode flag (a temporary or incognito thread) is session-SCOPED
+        yet keeps its entry too: it protects the conversation's transcript, which
+        outlives the provider session whose reclaimed file made the entry stale,
+        and a memory reader that finds the entry gone reads the thread as
+        persistent -- see :data:`_PRIVACY_FLAGS` for the growth this buys.
 
         Returns the number of entries removed; a ``sid``-only reset is a repair,
         not a removal, so it is not counted.

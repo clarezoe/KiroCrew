@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { XCircle, AlertTriangle, CheckCircle, RefreshCw, Hourglass, Check, BookOpen, SlidersHorizontal } from 'lucide-react'
+import { Trans } from 'react-i18next'
+import { XCircle, CheckCircle, RefreshCw, Hourglass, Check, BookOpen, SlidersHorizontal } from 'lucide-react'
 import { api } from '../../api/client'
 import { Card, CardTitle, Btn, SendBtn, Input, Badge, EmptyState, Skeleton } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
@@ -30,7 +31,43 @@ import { useSortableTable } from '../../hooks/useSortableTable'
 import SortableHeader from '../../components/SortableHeader'
 
 import { i18nT } from '../../i18n/t'
-import { compareText, fmtDateTimeNumeric } from '../../i18n/format'
+import { compareText, fmtDateTimeNumeric, fmtList } from '../../i18n/format'
+import { parseErrorCode } from '../../utils/errorReport'
+
+/** `POST /api/memory/consolidate`'s code for a target the memory modes promise
+ *  leaves no durable trace (a Temporary or Incognito session). "Summarize now"
+ *  posts every stem `api.sessions` lists, those sessions included, and a row's
+ *  `memory_mode` cannot pre-filter them all: a channel thread flagged before its
+ *  transcript header carried the mode holds the flag in the session map alone,
+ *  which the list is not built from. So the tally sorts the refusals after the
+ *  fact -- a skip the user asked for by choosing the mode, counted apart from a
+ *  request that failed. */
+const RESTRICTED_TARGET_CODE = 'restricted_target_session'
+
+/** Machine-readable code from a rejected consolidate call's JSON body. Duck-typed
+ *  on `body` rather than `instanceof ApiError` (the `MobileConnectModal` shape),
+ *  so it keeps working under a mocked `api/client`. */
+const consolidateErrorCode = (reason: unknown): string | undefined =>
+  typeof reason === 'object' && reason !== null && 'body' in reason
+    ? parseErrorCode(typeof reason.body === 'string' ? reason.body : undefined)
+    : undefined
+
+/** The failed sessions, named in full under the tally as the notice's footer: a
+ *  UI-font label first, so a bare key does not read as an unexplained chip,
+ *  then every key as one locale-joined list in the mono font (identifiers, so
+ *  the unit style: no "and"). One sentence, one key -- the list is a `<Trans>`
+ *  component so a translation can place it where its grammar wants. Every key
+ *  is in the DOM. A truncated list with the tail behind a hover tooltip hid it
+ *  from the keyboard, from assistive tech and from a screenshot alike; the list
+ *  wraps instead, inside the banner. */
+function FailedSessions({ keys }: { keys: readonly string[] }) {
+  return (
+    <Trans
+      i18nKey="pages.overview.memoryTab.failed_sessions_named"
+      components={{ keys: <span className="font-mono" data-testid="consolidate-failed-keys">{fmtList(keys, { type: 'unit', style: 'short' })}</span> }}
+    />
+  )
+}
 
 /** The Scope cell. The three values are the three delete selectors the list
  *  reports, and each must read differently: a fragment is that scope's row;
@@ -171,6 +208,10 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
   const [consolidating, setConsolidating] = useState(false)
   const [consolidateMsg, setConsolidateMsg] = useState<ReactNode>('')
   const [consolidateOk, setConsolidateOk] = useState(false)
+  // The failed tally, apart from the status message: it reports rejected
+  // requests, so it renders through ErrorNotice like every other failure, and
+  // it names the sessions that failed so the reader can act on it.
+  const [consolidateError, setConsolidateError] = useState<{ tally: string; failedKeys: string[] } | null>(null)
   // Track all "Saved" / "consolidate-msg-clear" timeout ids so they can be
   // cleared on unmount — otherwise a pending setTimeout fires after the
   // component is gone and (in vitest) shows up as an unhandled error from
@@ -251,17 +292,39 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
     }
   }, [refreshTrigger, loadLessons, queryClient])
   const consolidate = async () => {
-    setConsolidating(true); setConsolidateMsg(''); setConsolidateOk(false)
+    setConsolidating(true); setConsolidateMsg(''); setConsolidateOk(false); setConsolidateError(null)
     const sessions = await api.sessions(200).catch(() => ({ sessions: [] }))
     const keys = sessions?.sessions?.map((s: SessionInfo) => s.key).filter(Boolean) || []
     if (keys.length === 0) { setConsolidateMsg(<><XCircle className="lucide-inline" /> {i18nT('pages.overview.memoryTab.no_sessions_to_consolidate_start_a_chat_first')}</>); setConsolidating(false); return }
     const results = await Promise.allSettled(keys.map((k: string) => api.consolidateMemory(k, true)))
     const succeeded = results.filter(r => r.status === 'fulfilled').length
-    const failed = results.filter(r => r.status === 'rejected').length
-    if (failed > 0) setConsolidateMsg(<><AlertTriangle className="lucide-inline" /> {i18nT('pages.overview.memoryTab.consolidated_sessions_failed', { succeeded, total: keys.length, failed })}</>)
-    else { setConsolidateMsg(<><CheckCircle className="lucide-inline" /> {i18nT('pages.overview.memoryTab.consolidated')} {i18nT('pages.overview.memoryTab.session', { count: succeeded })}</>); setConsolidateOk(true) }
+    // Sort every rejection by the KEY it was for, so the failed tally can name
+    // its sessions: the counts alone leave the user unable to act on a failure.
+    const failedKeys: string[] = []
+    let skipped = 0
+    results.forEach((r, i) => {
+      if (r.status !== 'rejected') return
+      if (consolidateErrorCode(r.reason) === RESTRICTED_TARGET_CODE) skipped += 1
+      else failedKeys.push(keys[i])
+    })
+    const failed = failedKeys.length
+    const tally = { succeeded, total: keys.length, failed, skipped }
+    if (failed > 0) {
+      // Persistent until dismissed: a failure the user has to act on must not
+      // vanish on a timer the way the success tally does.
+      setConsolidateError({
+        tally: skipped > 0
+          ? i18nT('pages.overview.memoryTab.consolidated_sessions_failed_skipped', tally)
+          : i18nT('pages.overview.memoryTab.consolidated_sessions_failed', tally),
+        failedKeys,
+      })
+    } else if (skipped > 0) {
+      setConsolidateMsg(<><CheckCircle className="lucide-inline" /> {i18nT('pages.overview.memoryTab.consolidated_sessions_skipped', tally)}</>); setConsolidateOk(true)
+    } else {
+      setConsolidateMsg(<><CheckCircle className="lucide-inline" /> {i18nT('pages.overview.memoryTab.consolidated')} {i18nT('pages.overview.memoryTab.session', { count: succeeded })}</>); setConsolidateOk(true)
+    }
     setConsolidating(false)
-    scheduleClear(() => setConsolidateMsg(''), 4000)
+    if (failed === 0) scheduleClear(() => setConsolidateMsg(''), 4000)
   }
   const addLesson = async () => {
     if (!rule) return
@@ -311,6 +374,28 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
         )}
         <Btn onClick={async () => { await api.saveMemorySettings({ history_idle_hours: idleHours, history_max_days: maxDays }); setSettingsSaved(true); scheduleClear(() => setSettingsSaved(false), 2000) }}>{settingsSaved ? <><Check className="lucide-inline" /> {i18nT('pages.overview.memoryTab.saved')}</> : i18nT('pages.overview.memoryTab.save')}</Btn>
         <Btn onClick={consolidate} disabled={consolidating}>{consolidating ? <><Hourglass className="lucide-inline" /> {i18nT('pages.overview.memoryTab.running')}</> : <><RefreshCw className="lucide-inline" /> {i18nT('pages.overview.memoryTab.summarize_now')}</>}</Btn>
+        {/* No hand-off: the tab holds unsaved drafts -- the lesson rule being
+            typed below and the store text in the editors -- that the hand-off's
+            navigation would discard.
+
+            The block variant, on its own flex line (`basis-full`) so the button
+            row stays a row: a failure that persists until dismissed and carries
+            a list of session keys is a banner, not a run of text beside the
+            buttons -- inline, the keys sat against the dismiss control, where a
+            bare identifier read as a chip the ✕ might delete. The keys ride
+            INSIDE the notice as its footer, under the tally and away from the
+            control (the `SkillsTab` refusal-findings shape): one failure, one
+            surface, every key named. */}
+        {consolidateError && (
+          <ErrorNotice
+            className="basis-full"
+            message={consolidateError.tally}
+            footer={<FailedSessions keys={consolidateError.failedKeys} />}
+            onDismiss={() => setConsolidateError(null)}
+            askAgent={false}
+            testId="consolidate-failed"
+          />
+        )}
         {consolidateMsg && <span className={`text-[13px] ${consolidateOk ? 'text-ok' : 'text-danger'}`}>{consolidateMsg}</span>}
 
         {migrated && <span className="text-[12px] text-muted ml-2">{i18nT('pages.overview.memoryTab.semantic_memory_active_text_files_are_read_only')}</span>}

@@ -90,6 +90,60 @@ class TestFlags:
         assert sm.get_flag("slack:1.2", "temporary") is True  # namespaced read
 
 
+class TestPrivacyFlagsSurvivePrune:
+    """A ``temporary`` / ``incognito`` flag keeps its entry through both stale paths.
+
+    The flag protects the conversation's transcript, which outlives the provider
+    session whose reclaimed file makes the entry stale; a memory reader that
+    finds the entry gone reads the thread as persistent. Mutation: drop
+    ``_PRIVACY_FLAGS`` from ``_has_durable_flag`` — every test here goes red.
+    """
+
+    def test_flag_names_are_the_privacy_mode_names(self):
+        from kiro_crew.messaging import privacy_mode
+        from kiro_crew.session_map import _PRIVACY_FLAGS
+
+        assert _PRIVACY_FLAGS == {privacy_mode.MODE_TEMPORARY, privacy_mode.MODE_INCOGNITO}
+
+    @pytest.mark.parametrize("flag", ["temporary", "incognito"])
+    def test_startup_prune_repairs_a_stale_flagged_entry_instead_of_dropping_it(
+        self, patched, flag
+    ):
+        key = "telegram:kirocrew:direct:4242"
+        sm = SessionMap()
+        sm.set(key, "sid-reclaimed-by-kiro-cli")  # no such file under the kiro dir
+        sm.set_flag(key, flag, True)
+        assert sm.prune() == 0
+        assert sm.get_flag(key, flag) is True
+        assert (sm._data.get(key) or {}).get("sid") == ""
+        # And on disk, so the next startup does not redo the repair.
+        reloaded = SessionMap()
+        assert reloaded.get_flag(key, flag) is True
+
+    def test_startup_prune_keeps_a_flagged_entry_that_never_ran_a_turn(self, patched):
+        """``!incognito`` as the very first message: no sid yet, nothing else on the entry."""
+        key = "telegram:kirocrew:direct:4242"
+        sm = SessionMap()
+        sm.set_flag(key, "incognito", True)
+        assert sm.prune() == 0
+        assert sm.get_flag(key, "incognito") is True
+
+    def test_the_per_read_repair_keeps_the_flag_too(self, patched):
+        """``get()`` on a stale sid takes the same predicate as the startup prune."""
+        key = "telegram:kirocrew:direct:4242"
+        sm = SessionMap()
+        sm.set(key, "sid-reclaimed-by-kiro-cli")
+        sm.set_flag(key, "temporary", True)
+        assert sm.get(key) is None
+        assert sm.get_flag(key, "temporary") is True
+
+    def test_an_unflagged_stale_entry_is_still_collected(self, patched):
+        """The widening is exactly the two privacy flags, not every entry."""
+        sm = SessionMap()
+        sm.set("telegram:kirocrew:direct:4242", "sid-reclaimed-by-kiro-cli")
+        assert sm.prune() == 1
+
+
 class TestOverrides:
     def test_agent_override_round_trip(self, patched):
         sm = SessionMap()

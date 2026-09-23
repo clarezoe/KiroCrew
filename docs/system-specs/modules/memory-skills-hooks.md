@@ -378,7 +378,31 @@ Idle detection: `_last_activity[key]` updated on every `maybe_consolidate()` cal
 
 **Both paths write to the session's captured store.** `_consolidate` captures the
 canonical execution context before its first await and refuses incognito or
-temporary sessions before reading their transcripts. V2 uses that context's exact
+temporary sessions before reading their transcripts -- from the execution record;
+from the transcript header's `memory_mode`, which `privacy_mode.apply_mode` stamps
+for a channel thread (tighten-only, upserted so a thread flagged before its first
+turn gets a metadata-only header that `ConversationLog.append` then keeps) so a
+transcript read never depends on the session map; or, for a channel thread whose
+header predates that stamp, from the session map's `temporary` / `incognito` flag
+(`SessionMap.set_flag`, keyed by the live `slack:<ts>` key), read through the
+consolidator's `SessionManager` the way the dashboard reads it
+(`privacy_mode.hydrate` + the trackers) after unfolding a transcript stem to its
+live key. The two records serve two readers -- the map flag is what the channel's
+inbound gate hydrates from per message, the header is what every memory reader
+refuses on -- and a privacy flag keeps its map entry alive through
+`SessionMap.prune` and the per-read repair (`_PRIVACY_FLAGS` in `session_map.py`),
+because the flag protects a transcript that outlives the provider session whose
+reclaimed file makes an entry stale; a thread flagged before the header stamp
+existed therefore still refuses, and that refusal copies the mode into the header
+(`_backfill_header_mode`, tighten-only, existing transcripts only). Every refusal
+goes through `_refuse_restricted`: a debug line naming the source, and the SEL
+denial the dashboard route records for the same target (`memory.consolidate` /
+`denied` / `restricted_target_session:<mode>:<key>`, `source="background"`,
+`caller="history_consolidator"`), recorded once per key per process because the
+idle sweep re-schedules a refused key every heartbeat tick. This is the memory-mode
+choke point every entry point inherits (idle sweep, `maybe_consolidate`, expiry
+sweep, dashboard trigger, CLI); the dashboard trigger adds its own target-side 403
+in front of it (see the route table below). V2 uses that context's exact
 member store and commits learned records, history and the retry receipt in one
 SQLite transaction. V1 retains `context.store_of_session(log, key)` and its
 Markdown and lesson fallback behavior. See [Memory across surfaces and channels](#memory-across-surfaces-and-channels).
@@ -2261,7 +2285,7 @@ before reading transcript bodies, opening learned memory or billing a model.
 | POST | `/api/memory/migrate` | Migrate markdown → structured memory (gated) |
 | POST | `/api/memory/import` | Import from JSON export (gated) |
 | POST | `/api/memory/promote` | Promote repeated episodic patterns to semantic facts, tombstoning the rows folded in (gated) |
-| POST | `/api/memory/consolidate` | Trigger consolidation for one session (restricted-mode check only) |
+| POST | `/api/memory/consolidate` | Trigger consolidation for one session. Gated on the caller like every write, and additionally on the TARGET: the body's `key` is resolved through `resolve_session_memory_mode` (live slot first, then the persisted execution record and transcript header) and a temporary or incognito target is 403 `restricted_target_session` before the running claim or any transcript read. For a channel key the live resolution answers off the session map alone, so the route also reads the target transcript's header off-loop and refuses on a `memory_mode` it carries -- a stem the map cannot unfold, or an entry the map does not hold, is refused like the mapped case instead of answering 200 for a pass `_consolidate` refuses. An unresolvable target mode proceeds, because `_consolidate` re-reads the mode of the exact transcript it consolidates and refuses on it |
 | GET | `/api/memory/context-preview?q=` | Preview injected semantic + episodic context |
 | GET | `/api/memory/observability?q=` | `stats` + `rejections` + `context_preview`, plus `reads` — the read-volume counters (see above). `reads` is resolved LAST, so it INCLUDES the reads this request itself performed; that is what lets a caller issue the same `q` twice and compare the two objects |
 | GET | `/api/memory/recall?q=` | V2 task recall with evidence. Explicit `store` requires the dashboard owner; the authenticated MCP path uses the owning session's canonical execution context and requires memory reads to be allowed. Invalid or unavailable member memory returns an explicit error |
