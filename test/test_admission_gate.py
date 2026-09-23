@@ -176,7 +176,7 @@ class TestCronAdmissionDeferral:
         # Deferred: never fired, not marked failed, still due next tick.
         assert executed == []
         assert job.last_status is None
-        assert job.id not in svc._running_tasks
+        assert job.id not in svc._claims
         infos = [
             r
             for r in caplog.records
@@ -479,13 +479,13 @@ class TestCronExprPassthrough:
         job.last_run_ts = time.time() - 120
 
         def claiming_check(cfg: object | None = None):
-            svc._executing.add(job.id)  # simulate a manual run claiming it
+            svc._claim_run(job.id, "manual")  # simulate a manual run claiming it
             return _admitted()
 
         with patch("kiro_crew.cron.admission_check", side_effect=claiming_check):
             await svc._on_timer()
         assert executed == []  # revalidated away, no duplicate
-        svc._executing.discard(job.id)
+        svc._claims.pop(job.id, None)
         await svc.stop()
 
     @pytest.mark.asyncio
@@ -493,7 +493,7 @@ class TestCronExprPassthrough:
         self, tmp_path: Path
     ) -> None:
         # Harder variant: the manual run starts AND FINISHES during the
-        # admission await, so the job is not in _executing. An id-only
+        # admission await, so the job holds no claim. An id-only
         # revalidation would double-fire; the live-object _is_due re-check
         # (advanced last_run_ts) must catch it.
         executed: list[str] = []
