@@ -4763,6 +4763,15 @@ class DashboardState:
         self.workflow_startup_task: asyncio.Task[None] | None = None
         self.context_builder = context_builder
         self.conversation_log = conversation_log
+        # Set except while the startup crewmate prune is pending: the gateway
+        # clears it before the listener binds (``_register_crewmate_prune_gate``)
+        # and sets it once the pass has settled; that function's middleware
+        # holds every mutating ``/api/`` request on it, so no session can bind
+        # an agent between the prune's history check of a candidate and its
+        # delete. Set by default so every other entry point -- tests, the CLI
+        # -- never waits.
+        self.crewmate_prune_settled = asyncio.Event()
+        self.crewmate_prune_settled.set()
         self.consolidator = consolidator
         self.task_runner = task_runner
         self.slack_client = slack_client
