@@ -75,6 +75,26 @@ PROJECTS_FILE = "projects.md"
 _DEFAULT_PREFERENCES = "# User Preferences\n\n<!-- Learned from conversations -->\n"
 _DEFAULT_PROJECTS = "# Active Projects\n\n<!-- Current work context -->\n"
 
+
+def _read_text_tolerant(path: Path) -> str:
+    """Read ``path`` as UTF-8, tolerating a stray non-UTF-8 byte.
+
+    For a valid UTF-8 file this returns the exact same string a bare
+    ``path.read_text(encoding="utf-8")`` returns. For a file with an
+    undecodable byte it logs once at warning level with the path and decodes
+    with ``errors="replace"``, so callers receive the surviving content rather
+    than a ``UnicodeDecodeError``. Used only on PURE readers that never write
+    their result back (recent-history assembly and index rebuild); the
+    read-modify-write readers (preferences/projects, append_history) keep a
+    strict decode so a lossy render is never committed over the original bytes.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        logger.warning("Non-UTF-8 byte in memory file %s; decoding with replacement", path)
+        return path.read_text(encoding="utf-8", errors="replace")
+
+
 # Explicit history readers can stat and read many daily files. The assembled
 # string changes only when a day's history file is written
 # (append_history) or pruned, so a short TTL keeps it off the hot path while
@@ -376,6 +396,12 @@ class MemoryStore:
             return self._guarded_entry(self._preferences_file, require_readable=True)["content"]
         require_memory_ready(self._memory_store_name)
         if self._preferences_file.exists():
+            # Strict decode on purpose: this value feeds read-modify-write
+            # callers (the consolidator's CAS baseline, add_preference, the
+            # dashboard Save). A lossy errors="replace" read here would let a
+            # whole-file write persist U+FFFD over the original bytes with no
+            # backup on the V1 path. An undecodable file raises and is left
+            # intact and recoverable.
             return self._preferences_file.read_text(encoding="utf-8")
         return ""
 
@@ -438,6 +464,8 @@ class MemoryStore:
             return self._guarded_entry(self._projects_file, require_readable=True)["content"]
         require_memory_ready(self._memory_store_name)
         if self._projects_file.exists():
+            # Strict decode on purpose — see read_preferences: this value feeds
+            # read-modify-write callers, so a lossy read must not round-trip.
             return self._projects_file.read_text(encoding="utf-8")
         return ""
 
@@ -591,6 +619,11 @@ class MemoryStore:
                     )
                 content = ""
                 if path.exists():
+                    # Strict decode on this read-modify-write path: the block
+                    # below rewrites the whole file, so a lossy errors="replace"
+                    # read here would persist U+FFFD over the original bytes and
+                    # destroy them. An undecodable today-file raises and is left
+                    # intact and recoverable. Pure readers use _read_text_tolerant.
                     content = path.read_text(encoding="utf-8")
                 if not content:
                     date = datetime.now().strftime("%Y-%m-%d")
@@ -763,7 +796,7 @@ class MemoryStore:
             path = self._history_dir / f"{day.strftime('%Y-%m-%d')}.md"
             if not path.exists():
                 continue
-            content = path.read_text(encoding="utf-8").strip()
+            content = _read_text_tolerant(path).strip()
             if not content:
                 continue
 
@@ -1366,10 +1399,10 @@ class MemoryStore:
         files: list[tuple[str, str]] = []
         for path in (self._preferences_file, self._projects_file):
             if path.exists():
-                files.append((str(path), path.read_text(encoding="utf-8")))
+                files.append((str(path), _read_text_tolerant(path)))
         if self._history_dir.exists():
             for path in self._history_dir.glob("*.md"):
-                files.append((str(path), path.read_text(encoding="utf-8")))
+                files.append((str(path), _read_text_tolerant(path)))
         sources = iter(files)
 
         conn = None

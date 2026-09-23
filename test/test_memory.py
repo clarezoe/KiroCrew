@@ -347,3 +347,91 @@ class TestRecallSearchFallback:
         store.append_history("Terraform Quartzscope infrastructure decision rationale recorded")
         rows = store.search(question, match_any=True)
         assert len(rows) == 1 and "rationale recorded" in rows[0]["snippet"]
+
+
+class TestNonUtf8Tolerance:
+    """A stray non-UTF-8 byte in a memory file is handled by read half.
+
+    The PURE readers (``read_recent_history``, ``rebuild_index``) return the
+    surviving content instead of raising ``UnicodeDecodeError`` — they never
+    write their result back. The read-modify-write readers
+    (``read_preferences``, ``read_projects``, ``append_history``) keep a
+    strict decode: their value feeds a whole-file rewrite, so a lossy render
+    must never round-trip. An undecodable file raises there and is left intact
+    and recoverable. A valid UTF-8 file reads byte-identically everywhere.
+    """
+
+    # An invalid UTF-8 lead byte (0xff never appears in valid UTF-8).
+    BAD = b"# Prefs\n\n- good line \xff bad byte\n"
+
+    def test_read_preferences_strict_leaves_corrupt_file_intact(self, tmp_path):
+        """read_preferences feeds RMW callers, so it decodes strictly."""
+        import pytest
+
+        store = MemoryStore(workspace=tmp_path)
+        store.init()
+        store._preferences_file.write_bytes(self.BAD)
+        with pytest.raises(UnicodeDecodeError):
+            store.read_preferences()
+        assert store._preferences_file.read_bytes() == self.BAD
+
+    def test_read_projects_strict_leaves_corrupt_file_intact(self, tmp_path):
+        """read_projects feeds RMW callers, so it decodes strictly."""
+        import pytest
+
+        store = MemoryStore(workspace=tmp_path)
+        store.init()
+        store._projects_file.write_bytes(self.BAD)
+        with pytest.raises(UnicodeDecodeError):
+            store.read_projects()
+        assert store._projects_file.read_bytes() == self.BAD
+
+    def test_read_recent_history_tolerates_bad_byte(self, tmp_path):
+        store = MemoryStore(workspace=tmp_path)
+        store.append_history("clean entry")
+        from datetime import date
+
+        day = store._history_dir / f"{date.today().isoformat()}.md"
+        day.write_bytes(b"# day\n\nsurviving \xff text\n")
+        out = store.read_recent_history(days=1)  # must not raise
+        assert "surviving" in out
+
+    def test_rebuild_index_tolerates_bad_history_byte(self, tmp_path):
+        store = MemoryStore(workspace=tmp_path)
+        store.append_history("clean entry")
+        from datetime import date
+
+        day = store._history_dir / f"{date.today().isoformat()}.md"
+        day.write_bytes(b"# day\n\nsurviving \xff text\n")
+        count = store.rebuild_index()  # must not raise
+        assert count >= 1
+
+    def test_append_history_does_not_rewrite_corrupt_file_lossily(self, tmp_path):
+        """A corrupt today-file must not be rewritten from a lossy decode.
+
+        append_history is read-modify-write: a tolerant read here would
+        persist U+FFFD over the original bytes. It keeps a strict decode, so
+        an undecodable today-file is left intact and recoverable on disk.
+        """
+        import pytest
+
+        store = MemoryStore(workspace=tmp_path)
+        store.append_history("first entry")
+        from datetime import date
+
+        day = store._history_dir / f"{date.today().isoformat()}.md"
+        corrupt = day.read_bytes() + b"\ncorrupt \xff marker\n"
+        day.write_bytes(corrupt)
+        # Strict read on the write path raises rather than silently rewriting.
+        with pytest.raises(UnicodeDecodeError):
+            store.append_history("second entry")
+        # Original bytes are untouched: no lossy U+FFFD written to disk.
+        assert day.read_bytes() == corrupt
+
+    def test_good_file_is_byte_identical(self, tmp_path):
+        """A valid UTF-8 file reads exactly as a bare decode would."""
+        from kiro_crew.memory import _read_text_tolerant
+
+        p = tmp_path / "good.md"
+        p.write_text("# Héllo\n\n- café ☕\n", encoding="utf-8")
+        assert _read_text_tolerant(p) == p.read_text(encoding="utf-8")
