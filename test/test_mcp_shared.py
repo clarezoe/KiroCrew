@@ -998,6 +998,40 @@ class TestStdioLoopCallerIdentity:
         finally:
             harness.close()
 
+    def test_identity_unattested_quotes_the_daemons_denial_when_the_frame_carries_it(
+        self, monkeypatch
+    ):
+        """The Toolbox-shim report: the one accurate diagnosis ("spawned X is not the spec's Y")
+        lived only in gatewayd's stdout, so the refusal steered operators at the
+        token and the spec instead. When the caller block carries the daemon's
+        ``identityDenial``, the refusal says it; without it, the text is unchanged
+        (the previous test)."""
+        from kiro_crew.mcp_caller import CallerContext, build_caller_meta
+
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "identity_unattested"),
+        )
+        reason = "spawned '/opt/local/bin/kirocrew' is not the spec's '/tb/0.7.0.8/bin/kirocrew'"
+        try:
+            msg = _tools_call(52, "echo")
+            msg["params"]["_meta"] = build_caller_meta(
+                CallerContext(
+                    session_key="dashboard:chat-69", from_gateway=True, identity_denial=reason
+                )
+            )
+            harness.send(msg)
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert "identity_unattested" in body
+            assert "spawned this server without a token because" in body
+            assert "/opt/local/bin/kirocrew" in body
+            assert "/tb/0.7.0.8/bin/kirocrew" in body
+        finally:
+            harness.close()
+
     @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="select interleave uses a POSIX pipe")
     def test_listing_while_busy_does_not_borrow_the_running_members_identity(self, monkeypatch):
         from kiro_crew.mcp_caller import CallerContext, build_caller_meta

@@ -1678,6 +1678,19 @@ def _run_stdio_dispatch_loop(
                         f"that session. Refusing the call rather than ignoring an "
                         f"operator's exclusion list."
                     )
+                    # The daemon withheld the token from THIS backend for a reason
+                    # it otherwise logs only to its own stdout; when the frame
+                    # carries it, the refusal says it, because the generic text
+                    # above points at the token and the spec, and the cause is
+                    # neither (in the Toolbox-shim report it was the spawned binary).
+                    _denial = _caller_ctx.identity_denial if _caller_ctx else ""
+                    if _denial:
+                        _refusal += (
+                            f" The gateway spawned this server without a token because: "
+                            f"{_denial}. That condition is in the agent spec's entry for "
+                            f"this server or the environment it declares; the gateway "
+                            f"re-reads both only at its own restart."
+                        )
                 elif _policy.unresolved == "resolution_failed":
                     # A DIFFERENT diagnosis and a different remedy from the branch
                     # below, which is why it cannot share that text: the gateway was
