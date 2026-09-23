@@ -15748,6 +15748,7 @@ async def _run_chat(
                 _max_continues = _empty_max_auto_continues()
                 if _empty_activity.productive:
                     slot._empty_response_retries = max(slot._empty_response_retries + 1, 2)
+                    slot._empty_episode_productive = True
                 else:
                     slot._empty_response_retries += 1
                 # Ordinal of THIS continuation (1-based): the counter minus the
@@ -15815,7 +15816,7 @@ async def _run_chat(
                 # turn's continuation reaches it at two with no verbatim
                 # retry), so the non-zero clause claims only that automatic
                 # recovery was attempted.
-                if _empty_activity.productive:
+                if _empty_activity.productive or slot._empty_episode_productive:
                     _empty_msg = (
                         "ℹ️ The turn ended without a closing reply. Send a "
                         "message to continue from where it stopped — completed "
@@ -16472,6 +16473,7 @@ async def _run_chat(
                 if slot._tool_stall_retries > 0 and not slot._tool_stall_exhausted_emitted:
                     _emit_recovery_outcome("tool_stall", "recovered", slot._tool_stall_retries)
             slot._empty_response_retries = 0
+            slot._empty_episode_productive = False
             slot._prompt_busy_retries = 0
             slot._acp_pipe_death_retries = 0
             slot._stale_recovery_retries = 0

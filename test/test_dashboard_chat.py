@@ -19984,6 +19984,77 @@ class TestEmptyResponseRetry:
         assert slot._empty_response_retries == 0
 
     @pytest.mark.asyncio
+    async def test_productive_episode_giveup_keeps_no_rerun_wording(self, tmp_path: Path) -> None:
+        """A give-up whose EPISODE was productive must keep the productive
+        wording, even though the final continuation turn itself produced
+        nothing.
+
+        The activity snapshot is rebuilt per turn, so the continuation that
+        streams nothing arrives at give-up with `productive=False`. The counter
+        cannot rescue it either: the productive jump (`= 2`) and the plain
+        non-productive ladder (`+= 1` twice) both land on 2. Without
+        episode-scoped state the card takes the counter>0 wording, whose "Just
+        send your message again to continue." is the same redo invitation the
+        continue rung removes one rung up — and the first turn of THIS episode
+        already ran a tool whose side effects landed.
+        """
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TOOL_CALL,
+            EVENT_TOOL_RESULT,
+            LLMEvent,
+        )
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+
+        _turns = {"n": 0}
+
+        async def _stream(msg):
+            _turns["n"] += 1
+            if _turns["n"] == 1:
+                # Productive: a tool ran, no closing reply. Takes the CONTINUE
+                # rung and queues the activity continuation.
+                yield LLMEvent(kind=EVENT_TOOL_CALL, tool_call_id="tc-1", title="send_message")
+                yield LLMEvent(kind=EVENT_TOOL_RESULT, tool_call_id="tc-1", text="sent")
+                yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
+            else:
+                # The continuation returns nothing at all -> give-up.
+                yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
+
+        client.stream = _stream
+        client.stream_command = _stream
+
+        await _run_chat(state, slot, "test message")
+        # Let the real drain task run the queued continuation turn, which is
+        # the turn that reaches give-up.
+        for _bg_task in list(state._background_tasks):
+            try:
+                await _bg_task
+            except Exception:
+                pass
+        await self._cancel_background_tasks(state)
+
+        assert _turns["n"] >= 2, "the queued continuation never ran"
+        notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
+        giveup = [
+            m
+            for m in notice_msgs
+            if "will not re-run" in m.get("content", "")
+            or "returned nothing this turn" in m.get("content", "")
+        ]
+        assert giveup, "give-up produced no notice card"
+        # The episode ran a tool: no card may invite the user to re-send.
+        assert not any("send your message again" in m.get("content", "") for m in notice_msgs), (
+            "the give-up card invites a resend, but the first turn of this "
+            "episode ran a tool whose side effects already landed"
+        )
+        assert any("will not re-run" in m.get("content", "") for m in notice_msgs)
+        # Terminal rung clears both the counter and the episode flag.
+        assert slot._empty_response_retries == 0
+        assert slot._empty_episode_productive is False
+
+    @pytest.mark.asyncio
     async def test_giveup_without_recoveries_drops_retry_claim(self, tmp_path: Path) -> None:
         """A give-up reached with the recovery counter still at zero (here: a
         nested depth>0 turn) must not assert that a retry and an auto-continue

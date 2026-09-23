@@ -2592,6 +2592,7 @@ class _ChatSlot:
         "_prestream_exhausted_cycles",
         "_poisoned_reset_used",
         "_empty_response_retries",
+        "_empty_episode_productive",
         "_promise_only_retries",
         "_promise_only_stop_gen",
         "_promise_only_session_stop_gen",
@@ -3300,6 +3301,13 @@ class _ChatSlot:
         # discard loop.
         self._poisoned_reset_used: bool = False
         self._empty_response_retries: int = 0
+        # Episode-scoped companion to that counter: True once any turn of the
+        # current empty-turn recovery episode was productive. The per-turn
+        # activity snapshot cannot say this, and the counter cannot either
+        # (a productive continuation and the plain ladder both land on 2), so
+        # the give-up notice needs this to avoid inviting a redo of work whose
+        # side effects already landed. Cleared with the counter on a landed turn.
+        self._empty_episode_productive: bool = False
         # One bounded synthetic continuation when a turn ended on a promise-only
         # final message (announced an immediate action, then yielded with no tool
         # call). Reset like the other per-turn retry budgets on a landed turn.
