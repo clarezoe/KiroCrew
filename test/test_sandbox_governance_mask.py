@@ -727,6 +727,76 @@ class TestForeignMaskShadowGuard:
         ):
             assert not sandbox.carveout_shadowed_by_foreign_mask(target), target
 
+    def test_the_staging_roots_own_mask_entry_is_not_a_foreign_ancestor(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """An ANCESTOR-LIFT producer asks about the mask entry it lifts.
+
+        Its per-call directory is a proper DESCENDANT of that entry, so asking
+        about the directory refuses on every layout, the default one included --
+        which is exactly why the aws-control staging site asks about the root.
+        Both are asserted, so the reason the site is shaped that way is pinned
+        rather than only its verdict.
+        """
+        monkeypatch.setattr(sandbox.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "relocated-crew"))
+        staging_root = str(tmp_path / "relocated-crew" / "aws-control-staging")
+
+        assert staging_root in sandbox._relocated_crew_targets(("aws-control-staging",))
+        assert not sandbox.carveout_shadowed_by_foreign_mask(staging_root)
+        assert sandbox.carveout_shadowed_by_foreign_mask(
+            os.path.join(staging_root, "drive-preview-abc")
+        )
+
+    def test_a_staging_root_beneath_a_masked_tree_is_shadowed(self, monkeypatch, tmp_path) -> None:
+        """A data home relocated beneath ``~/.gnupg`` keeps that mask.
+
+        The producer's own entry is exempt by the equality rule; the credential
+        tree above it is not, and that is the layout the staging site must
+        refuse rather than lift.
+        """
+        monkeypatch.setattr(sandbox.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / ".gnupg" / "relocated-crew"))
+        staging_root = str(tmp_path / ".gnupg" / "relocated-crew" / "aws-control-staging")
+
+        assert sandbox.carveout_shadowed_by_foreign_mask(staging_root)
+
+    def test_the_staging_site_refuses_to_spawn_under_a_foreign_mask(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The aws-control preview transfer fails closed instead of spawning.
+
+        The third carve-out producer: on a data home relocated beneath
+        ``~/.gnupg`` the staging carve-out would cancel that credential tree's
+        mask for the CLI child, so the transfer must raise before ``_checked``
+        runs -- and the per-call directory must still be cleaned up.
+        """
+        from kiro_crew.apps.builtins.aws_control.backend import storage
+
+        monkeypatch.setattr(sandbox.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / ".gnupg" / "relocated-crew"))
+        staging_root = tmp_path / ".gnupg" / "relocated-crew" / "aws-control-staging"
+        staging_root.mkdir(parents=True)
+        monkeypatch.setattr(storage, "_preview_staging_parent", lambda: staging_root)
+
+        def _never_spawn(*args: object, **kwargs: object) -> str:
+            raise AssertionError("the CLI must not be spawned under a foreign mask")
+
+        monkeypatch.setattr(storage, "_checked", _never_spawn)
+
+        with pytest.raises(ValueError, match="independently masked"):
+            storage.get_object_head_bytes(
+                "p",
+                "us-east-1",
+                "bucket",
+                "drive",
+                "key",
+                account="111122223333",
+                max_bytes=64,
+            )
+
+        assert not list(staging_root.iterdir()), "the per-call directory must be removed"
+
     def test_an_unmasked_location_is_not_shadowed(self) -> None:
         assert not sandbox.carveout_shadowed_by_foreign_mask(
             os.path.join(_home(), "projects", "notes")

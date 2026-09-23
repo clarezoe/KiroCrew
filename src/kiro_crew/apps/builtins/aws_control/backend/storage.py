@@ -53,7 +53,7 @@ from kiro_crew.config.paths import data_home
 from kiro_crew.deploy import engine
 from kiro_crew.deploy.engine import AWSError, _checked, _harden_bucket
 from kiro_crew.platform_compat import is_link_or_junction
-from kiro_crew.sandbox import crew_home_visible_spellings
+from kiro_crew.sandbox import carveout_shadowed_by_foreign_mask, crew_home_visible_spellings
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -872,6 +872,14 @@ def get_object_head_bytes(
     over the staged file, and the CLI reports ``ENOENT`` on a path the gateway
     just created.
 
+    Each spelling's staging ROOT is checked before the spawn
+    (:func:`sandbox.carveout_shadowed_by_foreign_mask`). That root is the mask
+    entry the lift cancels, so the guard's equality rule exempts it and only
+    some OTHER masked ancestor refuses — a data home relocated beneath one
+    (``KIROCREW_HOME`` under ``~/.gnupg``) would hand this child that whole tree,
+    so the transfer is refused instead of run. One shadowed spelling refuses the
+    call: the CLI needs every spelling, not a surviving subset.
+
     The mask is a Linux/macOS mechanism; Windows has no sandbox, so there the
     destination is pinned by IDENTITY instead of by hiding, and the pin covers
     the whole path, not just the file. The staging root and then the per-call
@@ -908,6 +916,16 @@ def get_object_head_bytes(
             platform_compat.chmod_safe(tmp_dir, 0o700)
         else:
             platform_compat.restrict_dir_to_owner(tmp_dir)
+        staging_spellings = crew_home_visible_spellings(tmp_dir)
+        for spelling in staging_spellings:
+            # Asked of the staging ROOT, which is the mask entry this lift cancels
+            # and therefore equality-exempt, so only some OTHER masked ancestor
+            # refuses. Asking about the per-call dir would refuse on every layout.
+            if carveout_shadowed_by_foreign_mask(os.path.dirname(spelling), mode="standard"):
+                raise ValueError(
+                    "preview staging sits beneath an independently masked directory; "
+                    "carving it out for the CLI would unmask that tree"
+                )
         tmp_path = os.path.join(tmp_dir, "object")
         # Ours, exclusively, before the CLI ever sees the name. A pre-planted
         # entry of any kind fails the create instead of becoming the target.
@@ -945,7 +963,7 @@ def get_object_head_bytes(
                 profile,
                 action="s3:GetObject",
                 timeout=60,
-                extra_visible_dirs=crew_home_visible_spellings(tmp_dir),
+                extra_visible_dirs=staging_spellings,
             )
         except AWSError as exc:
             # A byte range is unsatisfiable against a 0-byte object, and S3
