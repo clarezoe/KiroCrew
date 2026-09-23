@@ -3513,6 +3513,48 @@ async def _handle_connection(
         stub_session_token,
     )
     _conn_index_add(conn)
+    if stub_session_token:
+        # Register-time resolution ran while nothing could reach this connection
+        # yet. A token-carrying connection is nameable by claim-push ALONE, and
+        # claim-push reaches it only through ``_CONN_INDEX`` — so a claim that
+        # binds this token across the awaits above (the peer walk, the start-id
+        # snapshot) matches ZERO connections and gives up, and whatever was read
+        # BEFORE those awaits stands for the connection's whole life: no identity
+        # at all, or the session this token has since been rekeyed away from.
+        #
+        # So re-ask the register's OWN question now that the index holds this
+        # connection, and take the answer WHOLE — ``None`` included, which is the
+        # same fail-closed verdict the register reaches for a token not claimed
+        # from this peer's attested runtime. Reading only the identity-less half
+        # would leave a stale name standing, which is worse than none.
+        #
+        # The factor is unchanged: the kernel-attested chain, never
+        # ``indexed_pids``, which folds in the stub's self-reported
+        # ``ancestor_pids``. No subscription eviction is owed on a change here —
+        # the first frame is not read until the loop below, so this connection
+        # cannot yet hold a grant made as the previous caller.
+        rebound = _token_caller(stub_session_token, peer_host_pids)
+        old_key = caller.session_key if caller is not None else ""
+        new_key = rebound.session_key if rebound is not None else ""
+        caller = rebound
+        conn.caller = rebound
+        if new_key != old_key:
+            if rebound is None:
+                _audit_caller_claimed(
+                    old_key,
+                    "",
+                    conn.pool_label,
+                    "denied",
+                    "token re-bound away from this peer's attested runtime",
+                )
+            else:
+                _audit_caller_claimed(old_key, new_key, conn.pool_label, "allowed")
+            logger.info(
+                "stub %s: token binding re-read once indexed — session_key=%s (was %s)",
+                stub_uuid,
+                new_key or "<none>",
+                old_key or "<none>",
+            )
 
     # Register this connection for the keepalive probe. Scoped to the handler's
     # own task so a dead transport can cancel exactly the coroutine that is
